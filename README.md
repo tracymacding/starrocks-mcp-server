@@ -569,56 +569,6 @@ cat ~/.claude.json
 
 详细的故障排查步骤请参考 [完整安装指南](https://github.com/tracymacding/gemini-cli/blob/main/STARROCKS_EXPERT_完全安装指南.md)
 
-## 📚 可用工具
-
-MCP Server 提供以下诊断工具：
-
-| 工具名称 | 功能描述 |
-|---------|---------|
-| `get_recent_slow_queries` | 获取慢查询列表 |
-| `analyze_query_profile` | 深度分析查询 Profile |
-| `generate_html_report` | 生成 HTML 性能报告 |
-| `analyze_query_latency` | 分析查询延迟和 QPS |
-| `get_query_profile` | 获取查询执行 Profile |
-
-详细文档请参考 [QUICK_START.md](QUICK_START.md)
-
-## 🔧 开发
-
-### 项目结构
-
-```
-starrocks-mcp-server/
-├── starrocks-mcp.js              # MCP Server 主文件
-├── package.json                   # 项目配置
-├── .env.example                   # 配置模板
-├── install-starrocks-mcp.sh      # 安装脚本
-├── README.md                      # 本文件
-├── QUICK_START.md                 # 快速开始指南
-├── LOGGING.md                     # 日志文档
-└── logs/                          # 日志目录
-```
-
-### 测试
-
-```bash
-# 运行测试
-npm test
-
-# 测试日志系统
-node test-logging.js
-```
-
-### 日志
-
-服务器会自动记录所有请求和响应：
-
-- **位置**: `./logs/`
-- **格式**: 按日期分文件（`starrocks-mcp-YYYY-MM-DD.log`）
-- **内容**: 工具调用、SQL 查询、API 请求、错误信息
-
-详细文档: [LOGGING.md](LOGGING.md)
-
 ## 📖 相关文档
 
 - [快速开始指南](QUICK_START.md)
