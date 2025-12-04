@@ -140,12 +140,94 @@ StarRocks MCP Server 支持任何实现了 MCP 协议的客户端。以下是主
 
 ### 方式 1: Gemini CLI 配置
 
-[Gemini CLI](https://github.com/google-gemini/gemini-cli) 是 Google 官方的命令行工具，支持使用 DeepSeek 等多种 LLM 提供商。
+[Gemini CLI](https://github.com/google-gemini/gemini-cli) 是 Google 官方的命令行工具，原生支持 MCP 协议。根据是否需要使用 DeepSeek 作为 LLM 提供商，有两种配置方式：
 
-#### 1.1 安装 Gemini CLI
+#### 方式 1A: 原生 Gemini CLI（仅支持 Google Gemini）
+
+如果你只需要使用 Google Gemini API，可以安装原生版本。
+
+##### 1A.1 安装原生 Gemini CLI
 
 ```bash
-# 克隆 Gemini CLI 项目（已集成 StarRocks MCP Server 支持）
+# 全局安装 Gemini CLI
+npm install -g @google/generative-ai-cli
+
+# 验证安装
+gemini --version
+```
+
+##### 1A.2 配置 Google Gemini API Key
+
+```bash
+# 设置 API Key（从 https://aistudio.google.com/apikey 获取）
+export GOOGLE_API_KEY="your-google-api-key-here"
+
+# 或添加到 shell 配置文件
+echo 'export GOOGLE_API_KEY="your-google-api-key-here"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+##### 1A.3 配置 MCP Server
+
+创建或编辑 `~/.gemini/settings.json` 文件：
+
+```bash
+mkdir -p ~/.gemini
+nano ~/.gemini/settings.json
+```
+
+添加以下配置（**根据实际情况修改路径和连接信息**）：
+
+```json
+{
+  "mcpServers": {
+    "starrocks-expert": {
+      "command": "node",
+      "args": [
+        "/path/to/starrocks-mcp-server/starrocks-mcp.js"
+      ],
+      "env": {
+        "DB_HOST": "127.0.0.1",
+        "DB_PORT": "9030",
+        "DB_USER": "root",
+        "DB_PASSWORD": "your_password",
+        "CENTRAL_API": "http://localhost:80",
+        "CENTRAL_API_TOKEN": "your_api_token_here"
+      }
+    }
+  }
+}
+```
+
+##### 1A.4 验证配置
+
+```bash
+# 启动 Gemini CLI
+gemini
+
+# 检查 MCP 连接状态
+> /mcp list
+
+# 预期输出：
+# ✓ starrocks-expert: node .../starrocks-mcp.js (stdio) - Connected
+#   Tools: 34
+
+# 测试工具
+> 帮我查看 StarRocks 的存储健康状况
+```
+
+**注意**：原生 Gemini CLI 仅支持 Google Gemini API，不支持 DeepSeek 等其他 LLM 提供商。如需使用 DeepSeek，请使用方式 1B。
+
+---
+
+#### 方式 1B: 定制版 Gemini CLI（支持 DeepSeek，推荐）
+
+[定制版 Gemini CLI](https://github.com/tracymacding/gemini-cli) 扩展了原生版本，**支持 DeepSeek 等多种 LLM 提供商**，成本更低且性能优秀。
+
+##### 1B.1 安装定制版 Gemini CLI
+
+```bash
+# 克隆定制版 Gemini CLI 项目
 git clone https://github.com/tracymacding/gemini-cli.git
 cd gemini-cli
 
@@ -155,11 +237,49 @@ npm install
 # 构建项目
 npm run build
 
-# 全局链接（可选）
+# 全局链接（方便直接使用 gemini 命令）
 npm link
 ```
 
-#### 1.2 配置 MCP Server
+##### 1B.2 验证安装
+
+```bash
+gemini --version
+# 应该显示版本号，例如: 0.8.0
+```
+
+##### 1B.3 配置 DeepSeek API Key
+
+**DeepSeek 优势**：
+- ✅ 比 Google Gemini 便宜约 90%（¥1/百万 tokens 输入）
+- ✅ 性能优秀（DeepSeek-V3）
+- ✅ 中文支持更好
+
+**方式 A: 使用 .env 文件（推荐）**
+
+```bash
+cd gemini-cli
+
+# 创建 .env 文件
+cat > .env <<'EOF'
+# DeepSeek API Key
+# 获取地址: https://platform.deepseek.com/
+DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
+EOF
+```
+
+**方式 B: 设置环境变量**
+
+```bash
+# 临时设置（当前终端有效）
+export DEEPSEEK_API_KEY="sk-your-deepseek-api-key-here"
+
+# 永久设置（添加到 shell 配置）
+echo 'export DEEPSEEK_API_KEY="sk-your-deepseek-api-key-here"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+##### 1B.4 配置 MCP Server
 
 创建或编辑 `~/.gemini/settings.json` 文件：
 
@@ -203,10 +323,19 @@ nano ~/.gemini/settings.json
 | `CENTRAL_API` | Expert 服务地址（可选） | `http://localhost:80` |
 | `CENTRAL_API_TOKEN` | API 认证 Token（可选） | 向管理员索取 |
 
-#### 1.3 验证配置
+##### 1B.5 验证配置
+
+**使用启动脚本（推荐）**：
 
 ```bash
-# 启动 Gemini CLI（推荐使用 DeepSeek）
+cd gemini-cli
+./start-gemini-cli.sh
+```
+
+**或手动启动**：
+
+```bash
+# 启动 Gemini CLI 并使用 DeepSeek
 gemini --provider deepseek -m deepseek-chat
 
 # 检查 MCP 连接状态
@@ -218,27 +347,29 @@ gemini --provider deepseek -m deepseek-chat
 
 # 查看可用工具
 > /tools
+
+# 测试工具
+> 帮我分析 StarRocks 的存储健康状况
 ```
 
-#### 1.4 配置 DeepSeek API Key
+**预期输出示例**：
 
-Gemini CLI 推荐使用 DeepSeek 作为 LLM 提供商（比 Google Gemini 更便宜）：
-
-```bash
-# 创建 .env 文件
-cd gemini-cli
-cat > .env <<'EOF'
-DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
-EOF
-
-# 获取 API Key: https://platform.deepseek.com/
 ```
+🤖 启动 Gemini CLI (DeepSeek + MCP)
+====================================
 
-启动脚本（已配置 DeepSeek + MCP）：
+✅ 已加载 .env 配置
+✅ DeepSeek API Key: sk-76b76...
+📡 检查中心 API 服务器...
+   ✅ API 服务器运行正常
+🔧 检查 MCP 配置...
+   ✅ MCP 服务器已连接
 
-```bash
-cd gemini-cli
-./start-gemini-cli.sh
+🚀 启动 Gemini CLI...
+
+💡 使用的功能:
+   • DeepSeek 模型 (deepseek-chat)
+   • MCP 工具 (StarRocks 诊断)
 ```
 
 ---
