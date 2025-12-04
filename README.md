@@ -81,13 +81,19 @@ StarRocks MCP Server 支持任何实现了 MCP 协议的客户端。以下是主
 
 ##### 1A.1 安装原生 Gemini CLI
 
+**官方文档**: [Gemini CLI Installation](https://geminicli.com/docs/get-started/installation/)
+
 ```bash
 # 全局安装 Gemini CLI
-npm install -g @google/generative-ai-cli
+npm install -g @google/gemini-cli
 
 # 验证安装
 gemini --version
 ```
+
+**参考资源**:
+- NPM 包: [@google/gemini-cli](https://www.npmjs.com/package/@google/gemini-cli)
+- GitHub: [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli)
 
 ##### 1A.2 配置 Google Gemini API Key
 
