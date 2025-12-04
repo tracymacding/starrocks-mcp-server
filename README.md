@@ -469,15 +469,6 @@ claude --version
 claude
 ```
 
-**其他访问方式**：
-
-除了 CLI，Claude Code 还支持：
-- **VS Code 扩展**: [Marketplace](https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code)
-- **JetBrains IDEs**: [Plugin Repository](https://plugins.jetbrains.com/plugin/27310-claude-code-beta-)
-- **Web 版本**: [claude.ai/code](https://claude.ai/code)
-
-**详细文档**: [code.claude.com/docs](https://code.claude.com/docs/en/overview)
-
 #### 3.2 配置 MCP Server
 
 **定位配置文件位置**：
