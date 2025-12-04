@@ -663,31 +663,7 @@ cat ~/.claude.json
 
 ---
 
-### 方式 4: 通用 MCP 客户端配置
-
-对于其他支持 MCP 协议的客户端，通常需要配置：
-
-```json
-{
-  "command": "node",
-  "args": ["/path/to/starrocks-mcp-server/starrocks-mcp.js"],
-  "env": {
-    "SR_HOST": "localhost",
-    "SR_USER": "root",
-    "SR_PASSWORD": "",
-    "SR_PORT": "9030",
-    "CENTRAL_API": "http://127.0.0.1:3002",
-    "CENTRAL_API_TOKEN": "your_api_token_here",
-    "PROMETHEUS_PROTOCOL": "http",
-    "PROMETHEUS_HOST": "localhost",
-    "PROMETHEUS_PORT": "9092"
-  }
-}
-```
-
----
-
-### 配置验证清单
+## 配置验证清单
 
 完成配置后，使用以下清单验证：
 
