@@ -663,46 +663,7 @@ cat ~/.claude.json
 
 ---
 
-### 方式 4: Cline (原 Claude Dev) 配置
-
-[Cline](https://github.com/cline/cline) 是一个流行的 VS Code AI 编程助手扩展。
-
-#### 4.1 安装扩展
-
-1. 打开 VS Code
-2. 搜索并安装 "Cline" 扩展
-
-#### 4.2 配置 MCP Server
-
-打开 Cline 设置，添加 MCP 服务器：
-
-```json
-{
-  "cline.mcpServers": {
-    "starrocks": {
-      "command": "node",
-      "args": [
-        "/path/to/starrocks-mcp-server/starrocks-mcp.js"
-      ],
-      "env": {
-        "SR_HOST": "localhost",
-        "SR_USER": "root",
-        "SR_PASSWORD": "",
-        "SR_PORT": "9030",
-        "CENTRAL_API": "http://127.0.0.1:3002",
-        "CENTRAL_API_TOKEN": "your_api_token_here",
-        "PROMETHEUS_PROTOCOL": "http",
-        "PROMETHEUS_HOST": "localhost",
-        "PROMETHEUS_PORT": "9092"
-      }
-    }
-  }
-}
-```
-
----
-
-### 方式 5: 通用 MCP 客户端配置
+### 方式 4: 通用 MCP 客户端配置
 
 对于其他支持 MCP 协议的客户端，通常需要配置：
 
