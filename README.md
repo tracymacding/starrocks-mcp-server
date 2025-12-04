@@ -650,32 +650,3 @@ mysql -h $SR_HOST -P $SR_PORT -u $SR_USER -p
 2. 确认 StarRocks Expert 服务是否运行
 3. 验证 API Token 是否正确
 
-## 🤝 贡献
-
-欢迎贡献！请遵循以下步骤：
-
-1. Fork 本项目
-2. 创建特性分支：`git checkout -b feature/your-feature`
-3. 提交更改：`git commit -m 'Add some feature'`
-4. 推送到分支：`git push origin feature/your-feature`
-5. 提交 Pull Request
-
-## 📄 许可证
-
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
-
-## 👥 作者
-
-- 维护者：[@tracymacding](https://github.com/tracymacding)
-- 贡献者：查看 [Contributors](../../graphs/contributors)
-
-## 🔗 相关链接
-
-- [StarRocks 官网](https://www.starrocks.io/)
-- [Model Context Protocol](https://modelcontextprotocol.io/)
-- [Claude Desktop](https://claude.ai/download)
-- [Operation Experts 项目](https://github.com/tracymacding/operation-experts)
-
----
-
-如有问题或建议，请提交 [Issue](../../issues)
