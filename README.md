@@ -54,7 +54,7 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/your-org/starrocks-mcp-server.git
+git clone https://github.com/tracymacding/starrocks-mcp-server.git
 cd starrocks-mcp-server
 
 # 运行安装脚本
