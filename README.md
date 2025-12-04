@@ -10,8 +10,7 @@
 
 - ✅ **MCP 协议支持**: 完整实现 MCP Stdio Server 协议
 - ✅ **数据库连接**: 连接 StarRocks 数据库执行 SQL 查询
-- ✅ **智能诊断**: 集成 StarRocks Expert 系统进行性能分析
-- ✅ **多客户端支持**: 兼容 Claude Desktop、Cline、任何 MCP 客户端
+- ✅ **多客户端支持**: 兼容 Gemini CLI、Claude Code CLI 等 MCP 客户端
 - ✅ **日志系统**: 完整的请求/响应日志记录
 - ✅ **安全性**: 支持环境变量配置，保护敏感信息
 
@@ -619,22 +618,6 @@ node test-logging.js
 - **内容**: 工具调用、SQL 查询、API 请求、错误信息
 
 详细文档: [LOGGING.md](LOGGING.md)
-
-## 🤝 集成 StarRocks Expert
-
-StarRocks MCP Server 可以连接到 [StarRocks Expert](https://github.com/tracymacding/operation-experts) 中心服务，获得更强大的分析能力：
-
-```bash
-# 1. 启动 StarRocks Expert 服务
-cd /path/to/operation-experts/starrocks-expert
-pm2 start src/server-solutionc.js --name starrocks-expert
-
-# 2. 配置 MCP Server
-echo "CENTRAL_API=http://localhost:80" >> .env
-
-# 3. 启动 MCP Server
-node starrocks-mcp.js
-```
 
 ## 📖 相关文档
 
