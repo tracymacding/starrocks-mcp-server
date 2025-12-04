@@ -1,0 +1,32 @@
+{
+  "tenants": {
+    "tenant_demo": {
+      "name": "Demo Company",
+      "agent_url": "http://localhost:8080",
+      "agent_token": "demo-secret-token-12345",
+      "description": "Demo tenant for testing",
+      "enabled": true,
+      "created_at": "2025-01-15T00:00:00Z"
+    },
+    "tenant_company_a": {
+      "name": "Company A",
+      "agent_url": "https://agent-a.company-a.com:8080",
+      "agent_token": "company-a-token-abcdef123456",
+      "description": "Production tenant for Company A",
+      "enabled": true,
+      "created_at": "2025-01-10T00:00:00Z"
+    },
+    "tenant_company_b": {
+      "name": "Company B",
+      "agent_url": "https://agent-b.company-b.com:8080",
+      "agent_token": "company-b-token-xyz789",
+      "description": "Production tenant for Company B",
+      "enabled": true,
+      "created_at": "2025-01-12T00:00:00Z"
+    }
+  },
+  "metadata": {
+    "version": "1.0.0",
+    "last_updated": "2025-01-15T00:00:00Z"
+  }
+}

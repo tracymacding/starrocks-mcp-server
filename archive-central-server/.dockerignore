@@ -1,0 +1,39 @@
+# Node modules
+node_modules
+npm-debug.log
+
+# Environment files
+.env
+.env.*
+
+# Git
+.git
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+test-*.js
+*.test.js
+
+# Logs
+logs
+*.log
+nohup.out
+
+# Temporary files
+tmp/
+temp/
+
+# IDE
+.vscode
+.idea
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# PDF documents
+*.pdf
