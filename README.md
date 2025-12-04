@@ -471,21 +471,16 @@ claude
 
 #### 3.2 配置 MCP Server
 
-**定位配置文件位置**：
-
-- **macOS/Linux**: `~/.config/claude-code/settings.json`
-- **Windows**: `%APPDATA%\claude-code\settings.json`
+**配置文件位置**：`~/.claude.json`
 
 **编辑配置文件**：
 
 ```bash
 # macOS/Linux
-mkdir -p ~/.config/claude-code
-nano ~/.config/claude-code/settings.json
+nano ~/.claude.json
 
 # Windows (PowerShell)
-New-Item -Path "$env:APPDATA\claude-code" -ItemType Directory -Force
-notepad "$env:APPDATA\claude-code\settings.json"
+notepad "$env:USERPROFILE\.claude.json"
 ```
 
 **添加以下配置**（根据实际情况修改）：
@@ -591,10 +586,10 @@ pwd
 
 ```bash
 # 检查配置文件是否存在
-cat ~/.config/claude-code/settings.json
+cat ~/.claude.json
 
 # 检查配置文件 JSON 格式是否正确
-cat ~/.config/claude-code/settings.json | jq .
+cat ~/.claude.json | jq .
 
 # 手动测试 MCP Server 是否能启动
 export DB_HOST=127.0.0.1
@@ -624,14 +619,14 @@ node /path/to/starrocks-mcp-server/starrocks-mcp.js
 
 **问题 3**: 配置文件路径不正确
 
-**macOS/Linux 查找配置目录**：
+**检查配置文件**：
 
 ```bash
-# 查找 Claude Code 配置目录
-find ~ -type d -name "claude-code" 2>/dev/null | grep config
+# 检查配置文件是否存在
+ls -la ~/.claude.json
 
-# 列出配置目录内容
-ls -la ~/.config/claude-code/
+# 查看配置文件内容
+cat ~/.claude.json
 ```
 
 ---
