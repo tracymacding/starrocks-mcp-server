@@ -394,75 +394,11 @@ gemini --provider deepseek -m deepseek-chat
 
 ---
 
-### 方式 2: Claude Desktop 配置
-
-[Claude Desktop](https://claude.ai/download) 是 Anthropic 官方的桌面应用，原生支持 MCP 协议。
-
-#### 2.1 找到配置文件
-
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-- **Linux**: `~/.config/Claude/claude_desktop_config.json`
-
-#### 2.2 编辑配置文件
-
-```bash
-# macOS/Linux
-nano ~/Library/Application\ Support/Claude/claude_desktop_config.json
-
-# 或者使用你喜欢的编辑器
-```
-
-添加以下配置：
-
-```json
-{
-  "mcpServers": {
-    "starrocks": {
-      "command": "node",
-      "args": [
-        "/path/to/starrocks-mcp-server/starrocks-mcp.js"
-      ],
-      "env": {
-        "SR_HOST": "localhost",
-        "SR_USER": "root",
-        "SR_PASSWORD": "",
-        "SR_PORT": "9030",
-        "CENTRAL_API": "http://127.0.0.1:3002",
-        "CENTRAL_API_TOKEN": "your_api_token_here",
-        "PROMETHEUS_PROTOCOL": "http",
-        "PROMETHEUS_HOST": "localhost",
-        "PROMETHEUS_PORT": "9092"
-      }
-    }
-  }
-}
-```
-
-**⚠️ 注意**：
-- 必须使用**完整的绝对路径**，不能使用 `~` 或相对路径
-- Windows 路径使用双反斜杠：`C:\\Users\\...\\starrocks-mcp.js`
-
-#### 2.3 验证配置
-
-1. 重启 Claude Desktop
-2. 打开新对话
-3. 在输入框上方应该能看到 🔌 图标，点击查看已连接的 MCP 服务器
-4. 输入测试命令：
-
-```
-请列出 StarRocks MCP Server 提供的所有工具
-```
-
-Claude 应该会显示所有可用的诊断工具。
-
----
-
-### 方式 3: Claude Code CLI 配置
+### 方式 2: Claude Code CLI 配置
 
 [Claude Code](https://claude.ai/claude-code) 是 Anthropic 官方的命令行 AI 编程工具，原生支持 MCP 协议。
 
-#### 3.1 安装 Claude Code CLI
+#### 2.1 安装 Claude Code CLI
 
 **快速安装**：
 
@@ -492,7 +428,7 @@ claude --version
 claude
 ```
 
-#### 3.2 配置 MCP Server
+#### 2.2 配置 MCP Server
 
 **配置文件位置**：`~/.claude.json`
 
@@ -560,7 +496,7 @@ pwd
 # 输出完整路径，例如: /home/user/starrocks-mcp-server
 ```
 
-#### 3.3 验证配置
+#### 2.3 验证配置
 
 1. **启动 Claude Code CLI**：
 
@@ -607,7 +543,7 @@ pwd
    - ✅ 执行 SQL 查询并返回分析结果
    - ✅ 提供专业的诊断建议
 
-#### 3.4 故障排查
+#### 2.4 故障排查
 
 **问题 1**: 提示 "MCP Server not found" 或 "Connection failed"
 
