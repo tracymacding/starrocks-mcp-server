@@ -567,15 +567,6 @@ cat ~/.claude.json
    # 应该启动并等待 MCP 协议输入
    ```
 
-详细的故障排查步骤请参考 [完整安装指南](https://github.com/tracymacding/gemini-cli/blob/main/STARROCKS_EXPERT_完全安装指南.md)
-
-## 📖 相关文档
-
-- [快速开始指南](QUICK_START.md)
-- [日志系统文档](LOGGING.md)
-- [MCP 协议规范](https://modelcontextprotocol.io/)
-- [StarRocks Expert 项目](https://github.com/tracymacding/operation-experts)
-
 ## 🐛 故障排查
 
 ### MCP Server 无法连接
