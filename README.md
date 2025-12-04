@@ -441,20 +441,42 @@ Claude 应该会显示所有可用的诊断工具。
 
 #### 3.1 安装 Claude Code CLI
 
-**下载并安装**：
+**快速安装**：
 
-访问 [claude.ai/claude-code](https://claude.ai/claude-code) 下载适合你操作系统的版本：
+Claude Code 提供了一键安装脚本，支持 macOS、Linux 和 Windows：
 
-- **macOS**: 下载 .dmg 文件并安装
-- **Linux**: 下载 .AppImage 或使用包管理器安装
-- **Windows**: 下载 .exe 安装程序
+**macOS/Linux**：
+
+```bash
+# 一键安装
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
+**Windows (PowerShell)**：
+
+```powershell
+# 一键安装
+irm https://claude.ai/install.ps1 | iex
+```
 
 **验证安装**：
 
 ```bash
 # 检查 Claude Code 是否已安装
-claude-code --version
+claude --version
+
+# 或直接启动
+claude
 ```
+
+**其他访问方式**：
+
+除了 CLI，Claude Code 还支持：
+- **VS Code 扩展**: [Marketplace](https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code)
+- **JetBrains IDEs**: [Plugin Repository](https://plugins.jetbrains.com/plugin/27310-claude-code-beta-)
+- **Web 版本**: [claude.ai/code](https://claude.ai/code)
+
+**详细文档**: [code.claude.com/docs](https://code.claude.com/docs/en/overview)
 
 #### 3.2 配置 MCP Server
 
@@ -529,11 +551,11 @@ pwd
 
    ```bash
    # 方式 1: 直接启动
-   claude-code
+   claude
 
    # 方式 2: 在项目目录中启动
    cd /path/to/your/project
-   claude-code
+   claude
    ```
 
 2. **检查 MCP Server 连接**：
