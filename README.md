@@ -435,35 +435,52 @@ Claude 应该会显示所有可用的诊断工具。
 
 ---
 
-### 方式 3: Claude Code (VS Code Extension) 配置
+### 方式 3: Claude Code CLI 配置
 
-[Claude Code](https://marketplace.visualstudio.com/items?itemName=Anthropic.claude-code) 是 VS Code 中的 AI 助手扩展。
+[Claude Code](https://claude.ai/claude-code) 是 Anthropic 官方的命令行 AI 编程工具，原生支持 MCP 协议。
 
-#### 3.1 安装扩展
+#### 3.1 安装 Claude Code CLI
 
-1. 打开 VS Code
-2. 进入扩展市场（Ctrl+Shift+X / Cmd+Shift+X）
-3. 搜索 "Claude Code"
-4. 点击安装
+**下载并安装**：
+
+访问 [claude.ai/claude-code](https://claude.ai/claude-code) 下载适合你操作系统的版本：
+
+- **macOS**: 下载 .dmg 文件并安装
+- **Linux**: 下载 .AppImage 或使用包管理器安装
+- **Windows**: 下载 .exe 安装程序
+
+**验证安装**：
+
+```bash
+# 检查 Claude Code 是否已安装
+claude-code --version
+```
 
 #### 3.2 配置 MCP Server
 
-方式 A: 通过 VS Code 设置界面
+**定位配置文件位置**：
 
-1. 打开 VS Code 设置（Ctrl+, / Cmd+,）
-2. 搜索 "Claude Code MCP"
-3. 点击 "Edit in settings.json"
+- **macOS/Linux**: `~/.config/claude-code/settings.json`
+- **Windows**: `%APPDATA%\claude-code\settings.json`
 
-方式 B: 直接编辑 settings.json
+**编辑配置文件**：
 
-按 `Ctrl+Shift+P` / `Cmd+Shift+P`，输入 "Preferences: Open Settings (JSON)"
+```bash
+# macOS/Linux
+mkdir -p ~/.config/claude-code
+nano ~/.config/claude-code/settings.json
 
-添加以下配置：
+# Windows (PowerShell)
+New-Item -Path "$env:APPDATA\claude-code" -ItemType Directory -Force
+notepad "$env:APPDATA\claude-code\settings.json"
+```
+
+**添加以下配置**（根据实际情况修改）：
 
 ```json
 {
-  "claudeCode.mcpServers": {
-    "starrocks": {
+  "mcpServers": {
+    "starrocks-expert": {
       "command": "node",
       "args": [
         "/path/to/starrocks-mcp-server/starrocks-mcp.js"
@@ -474,49 +491,135 @@ Claude 应该会显示所有可用的诊断工具。
         "DB_USER": "root",
         "DB_PASSWORD": "your_password",
         "CENTRAL_API": "http://localhost:80",
-        "CENTRAL_API_TOKEN": "your_api_token"
+        "CENTRAL_API_TOKEN": "your_api_token_here"
       }
     }
   }
 }
 ```
 
+**配置说明**：
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `command` | 执行命令（通常是 `node`） | `node` |
+| `args[0]` | MCP Server 脚本的完整路径 | `/home/user/starrocks-mcp-server/starrocks-mcp.js` |
+| `DB_HOST` | StarRocks 数据库地址 | `127.0.0.1` |
+| `DB_PORT` | StarRocks 查询端口 | `9030` |
+| `DB_USER` | 数据库用户名 | `root` |
+| `DB_PASSWORD` | 数据库密码 | 留空或填写密码 |
+| `CENTRAL_API` | Expert 服务地址（可选） | `http://localhost:80` |
+| `CENTRAL_API_TOKEN` | API Token（可选） | 向管理员索取 |
+
+**查找 MCP Server 路径**：
+
+```bash
+# 定位 starrocks-mcp.js 文件
+find ~ -name "starrocks-mcp.js" 2>/dev/null
+
+# 或者，如果你知道安装目录
+cd /path/to/starrocks-mcp-server
+pwd
+# 输出完整路径，例如: /home/user/starrocks-mcp-server
+```
+
 #### 3.3 验证配置
 
-1. **重启 VS Code**
+1. **启动 Claude Code CLI**：
 
-2. **打开 Claude Code 面板**（以下任一方式）：
+   ```bash
+   # 方式 1: 直接启动
+   claude-code
 
-   - **方式 1**: 使用快捷键
-     - Windows/Linux: `Ctrl+Shift+P`，输入 "Claude Code: Open Chat"
-     - macOS: `Cmd+Shift+P`，输入 "Claude Code: Open Chat"
-
-   - **方式 2**: 通过侧边栏图标
-     - 点击 VS Code 左侧活动栏中的 Claude Code 图标（通常是一个 AI 图标）
-
-   - **方式 3**: 通过菜单
-     - 顶部菜单 → View → Command Palette → 输入 "Claude Code: Open Chat"
-
-3. **验证 MCP Server 连接**：
-
-   在 Claude Code 面板中输入：
-
-   ```
-   检查 StarRocks MCP Server 的连接状态
+   # 方式 2: 在项目目录中启动
+   cd /path/to/your/project
+   claude-code
    ```
 
-   或者：
+2. **检查 MCP Server 连接**：
+
+   在 Claude Code 中输入：
 
    ```
    列出所有可用的 MCP 工具
    ```
 
+   或者：
+
+   ```
+   /tools
+   ```
+
+3. **测试 StarRocks 诊断功能**：
+
+   ```
+   帮我分析 StarRocks 的存储健康状况
+   ```
+
+   或者：
+
+   ```
+   查询最近 1 小时的慢查询
+   ```
+
 4. **预期结果**：
 
    Claude Code 应该能够：
-   - ✅ 识别并连接到 StarRocks MCP Server
-   - ✅ 列出可用的工具（如 `analyze_storage_amplification`, `get_recent_slow_queries` 等）
-   - ✅ 执行 StarRocks 相关的诊断命令
+   - ✅ 自动连接到 StarRocks MCP Server
+   - ✅ 列出所有可用工具（34 个 StarRocks 诊断工具）
+   - ✅ 执行 SQL 查询并返回分析结果
+   - ✅ 提供专业的诊断建议
+
+#### 3.4 故障排查
+
+**问题 1**: 提示 "MCP Server not found" 或 "Connection failed"
+
+**解决方法**：
+
+```bash
+# 检查配置文件是否存在
+cat ~/.config/claude-code/settings.json
+
+# 检查配置文件 JSON 格式是否正确
+cat ~/.config/claude-code/settings.json | jq .
+
+# 手动测试 MCP Server 是否能启动
+export DB_HOST=127.0.0.1
+export DB_PORT=9030
+export DB_USER=root
+export DB_PASSWORD=
+export CENTRAL_API=http://localhost:80
+export CENTRAL_API_TOKEN=your_token
+
+node /path/to/starrocks-mcp-server/starrocks-mcp.js
+# 应该启动并等待输入
+```
+
+**问题 2**: 工具执行失败
+
+**解决方法**：
+
+- 检查 StarRocks 数据库连接：
+  ```bash
+  mysql -h 127.0.0.1 -P 9030 -u root -e "SELECT 1"
+  ```
+
+- 检查中心 API 服务器（如果使用）：
+  ```bash
+  curl http://localhost:80/health
+  ```
+
+**问题 3**: 配置文件路径不正确
+
+**macOS/Linux 查找配置目录**：
+
+```bash
+# 查找 Claude Code 配置目录
+find ~ -type d -name "claude-code" 2>/dev/null | grep config
+
+# 列出配置目录内容
+ls -la ~/.config/claude-code/
+```
 
 ---
 
