@@ -71,35 +71,6 @@ cd starrocks-mcp-server
 
 StarRocks MCP Server 支持任何实现了 MCP 协议的客户端。以下是主流客户端的详细配置指南。
 
-### 配置前准备
-
-在配置任何客户端之前，请先准备以下信息：
-
-1. **StarRocks 数据库连接信息**:
-   - 主机地址 (`SR_HOST`): 例如 `localhost`
-   - 端口 (`SR_PORT`): 默认 `9030`
-   - 用户名 (`SR_USER`): 例如 `root`
-   - 密码 (`SR_PASSWORD`): 数据库密码
-
-2. **StarRocks Expert 中心 API** (可选，用于高级分析):
-   - API 地址 (`CENTRAL_API`): 例如 `http://127.0.0.1:3002`
-   - API Token (`CENTRAL_API_TOKEN`): 向管理员索取
-
-3. **Prometheus 配置** (可选，用于缓存指标查询):
-   - 协议 (`PROMETHEUS_PROTOCOL`): `http` 或 `https`
-   - 主机地址 (`PROMETHEUS_HOST`): 例如 `localhost`
-   - 端口 (`PROMETHEUS_PORT`): 例如 `9092`
-
-4. **MCP Server 安装路径**:
-   ```bash
-   # 找到 starrocks-mcp.js 的完整路径
-   cd /path/to/starrocks-mcp-server
-   pwd
-   # 记录输出的路径，例如: /home/user/starrocks-mcp-server
-   ```
-
----
-
 ### 方式 1: Gemini CLI 配置
 
 [Gemini CLI](https://github.com/google-gemini/gemini-cli) 是 Google 官方的命令行工具，原生支持 MCP 协议。根据是否需要使用 DeepSeek 作为 LLM 提供商，有两种配置方式：
