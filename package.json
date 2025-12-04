@@ -6,8 +6,7 @@
   "main": "starrocks-mcp.js",
   "scripts": {
     "start": "node starrocks-mcp.js",
-    "dev": "nodemon starrocks-mcp.js",
-    "test": "node test-logging.js"
+    "dev": "nodemon starrocks-mcp.js"
   },
   "keywords": [
     "starrocks",
