@@ -112,12 +112,157 @@ node starrocks-mcp.js
 
 ## 🔌 MCP 客户端配置
 
-### Claude Desktop
+StarRocks MCP Server 支持任何实现了 MCP 协议的客户端。以下是主流客户端的详细配置指南。
 
-编辑 Claude Desktop 配置文件：
+### 配置前准备
 
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+在配置任何客户端之前，请先准备以下信息：
+
+1. **StarRocks 数据库连接信息**:
+   - 主机地址 (`DB_HOST`): 例如 `127.0.0.1`
+   - 端口 (`DB_PORT`): 默认 `9030`
+   - 用户名 (`DB_USER`): 例如 `root`
+   - 密码 (`DB_PASSWORD`): 数据库密码
+
+2. **StarRocks Expert 中心 API** (可选，用于高级分析):
+   - API 地址 (`CENTRAL_API`): 例如 `http://localhost:80`
+   - API Token (`CENTRAL_API_TOKEN`): 向管理员索取
+
+3. **MCP Server 安装路径**:
+   ```bash
+   # 找到 starrocks-mcp.js 的完整路径
+   cd /path/to/starrocks-mcp-server
+   pwd
+   # 记录输出的路径，例如: /home/user/starrocks-mcp-server
+   ```
+
+---
+
+### 方式 1: Gemini CLI 配置
+
+[Gemini CLI](https://github.com/google-gemini/gemini-cli) 是 Google 官方的命令行工具，支持使用 DeepSeek 等多种 LLM 提供商。
+
+#### 1.1 安装 Gemini CLI
+
+```bash
+# 克隆 Gemini CLI 项目（已集成 StarRocks MCP Server 支持）
+git clone https://github.com/tracymacding/gemini-cli.git
+cd gemini-cli
+
+# 安装依赖
+npm install
+
+# 构建项目
+npm run build
+
+# 全局链接（可选）
+npm link
+```
+
+#### 1.2 配置 MCP Server
+
+创建或编辑 `~/.gemini/settings.json` 文件：
+
+```bash
+mkdir -p ~/.gemini
+nano ~/.gemini/settings.json
+```
+
+添加以下配置（**根据实际情况修改路径和连接信息**）：
+
+```json
+{
+  "mcpServers": {
+    "starrocks-expert": {
+      "command": "node",
+      "args": [
+        "/path/to/starrocks-mcp-server/starrocks-mcp.js"
+      ],
+      "env": {
+        "DB_HOST": "127.0.0.1",
+        "DB_PORT": "9030",
+        "DB_USER": "root",
+        "DB_PASSWORD": "your_password",
+        "CENTRAL_API": "http://localhost:80",
+        "CENTRAL_API_TOKEN": "your_api_token_here"
+      }
+    }
+  }
+}
+```
+
+**配置说明**：
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `args[0]` | MCP Server 脚本的完整路径 | `/home/user/starrocks-mcp-server/starrocks-mcp.js` |
+| `DB_HOST` | StarRocks 数据库地址 | `127.0.0.1` 或 `192.168.1.100` |
+| `DB_PORT` | StarRocks 查询端口 | `9030` (默认) |
+| `DB_USER` | 数据库用户名 | `root` |
+| `DB_PASSWORD` | 数据库密码 | 留空或填写实际密码 |
+| `CENTRAL_API` | Expert 服务地址（可选） | `http://localhost:80` |
+| `CENTRAL_API_TOKEN` | API 认证 Token（可选） | 向管理员索取 |
+
+#### 1.3 验证配置
+
+```bash
+# 启动 Gemini CLI（推荐使用 DeepSeek）
+gemini --provider deepseek -m deepseek-chat
+
+# 检查 MCP 连接状态
+> /mcp list
+
+# 预期输出：
+# ✓ starrocks-expert: node .../starrocks-mcp.js (stdio) - Connected
+#   Tools: 34
+
+# 查看可用工具
+> /tools
+```
+
+#### 1.4 配置 DeepSeek API Key
+
+Gemini CLI 推荐使用 DeepSeek 作为 LLM 提供商（比 Google Gemini 更便宜）：
+
+```bash
+# 创建 .env 文件
+cd gemini-cli
+cat > .env <<'EOF'
+DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
+EOF
+
+# 获取 API Key: https://platform.deepseek.com/
+```
+
+启动脚本（已配置 DeepSeek + MCP）：
+
+```bash
+cd gemini-cli
+./start-gemini-cli.sh
+```
+
+---
+
+### 方式 2: Claude Desktop 配置
+
+[Claude Desktop](https://claude.ai/download) 是 Anthropic 官方的桌面应用，原生支持 MCP 协议。
+
+#### 2.1 找到配置文件
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+
+#### 2.2 编辑配置文件
+
+```bash
+# macOS/Linux
+nano ~/Library/Application\ Support/Claude/claude_desktop_config.json
+
+# 或者使用你喜欢的编辑器
+```
+
+添加以下配置：
 
 ```json
 {
@@ -131,27 +276,187 @@ node starrocks-mcp.js
         "DB_HOST": "127.0.0.1",
         "DB_PORT": "9030",
         "DB_USER": "root",
-        "DB_PASSWORD": "your_password"
+        "DB_PASSWORD": "your_password",
+        "CENTRAL_API": "http://localhost:80",
+        "CENTRAL_API_TOKEN": "your_api_token"
       }
     }
   }
 }
 ```
 
-### Cline (VS Code Extension)
+**⚠️ 注意**：
+- 必须使用**完整的绝对路径**，不能使用 `~` 或相对路径
+- Windows 路径使用双反斜杠：`C:\\Users\\...\\starrocks-mcp.js`
 
-在 Cline 设置中添加 MCP Server：
+#### 2.3 验证配置
+
+1. 重启 Claude Desktop
+2. 打开新对话
+3. 在输入框上方应该能看到 🔌 图标，点击查看已连接的 MCP 服务器
+4. 输入测试命令：
+
+```
+请列出 StarRocks MCP Server 提供的所有工具
+```
+
+Claude 应该会显示所有可用的诊断工具。
+
+---
+
+### 方式 3: Claude Code (VS Code Extension) 配置
+
+[Claude Code](https://marketplace.visualstudio.com/items?itemName=Anthropic.claude-code) 是 VS Code 中的 AI 助手扩展。
+
+#### 3.1 安装扩展
+
+1. 打开 VS Code
+2. 进入扩展市场（Ctrl+Shift+X / Cmd+Shift+X）
+3. 搜索 "Claude Code"
+4. 点击安装
+
+#### 3.2 配置 MCP Server
+
+方式 A: 通过 VS Code 设置界面
+
+1. 打开 VS Code 设置（Ctrl+, / Cmd+,）
+2. 搜索 "Claude Code MCP"
+3. 点击 "Edit in settings.json"
+
+方式 B: 直接编辑 settings.json
+
+按 `Ctrl+Shift+P` / `Cmd+Shift+P`，输入 "Preferences: Open Settings (JSON)"
+
+添加以下配置：
 
 ```json
 {
-  "mcpServers": {
+  "claudeCode.mcpServers": {
     "starrocks": {
       "command": "node",
-      "args": ["/path/to/starrocks-mcp-server/starrocks-mcp.js"]
+      "args": [
+        "/path/to/starrocks-mcp-server/starrocks-mcp.js"
+      ],
+      "env": {
+        "DB_HOST": "127.0.0.1",
+        "DB_PORT": "9030",
+        "DB_USER": "root",
+        "DB_PASSWORD": "your_password",
+        "CENTRAL_API": "http://localhost:80",
+        "CENTRAL_API_TOKEN": "your_api_token"
+      }
     }
   }
 }
 ```
+
+#### 3.3 验证配置
+
+1. 重启 VS Code
+2. 打开 Claude Code 面板
+3. 输入测试命令：
+
+```
+检查 StarRocks MCP Server 的连接状态
+```
+
+---
+
+### 方式 4: Cline (原 Claude Dev) 配置
+
+[Cline](https://github.com/cline/cline) 是一个流行的 VS Code AI 编程助手扩展。
+
+#### 4.1 安装扩展
+
+1. 打开 VS Code
+2. 搜索并安装 "Cline" 扩展
+
+#### 4.2 配置 MCP Server
+
+打开 Cline 设置，添加 MCP 服务器：
+
+```json
+{
+  "cline.mcpServers": {
+    "starrocks": {
+      "command": "node",
+      "args": [
+        "/path/to/starrocks-mcp-server/starrocks-mcp.js"
+      ],
+      "env": {
+        "DB_HOST": "127.0.0.1",
+        "DB_PORT": "9030",
+        "DB_USER": "root",
+        "DB_PASSWORD": ""
+      }
+    }
+  }
+}
+```
+
+---
+
+### 方式 5: 通用 MCP 客户端配置
+
+对于其他支持 MCP 协议的客户端，通常需要配置：
+
+```json
+{
+  "command": "node",
+  "args": ["/path/to/starrocks-mcp-server/starrocks-mcp.js"],
+  "env": {
+    "DB_HOST": "127.0.0.1",
+    "DB_PORT": "9030",
+    "DB_USER": "root",
+    "DB_PASSWORD": "your_password"
+  }
+}
+```
+
+---
+
+### 配置验证清单
+
+完成配置后，使用以下清单验证：
+
+- [ ] MCP Server 能成功启动（没有报错）
+- [ ] 客户端显示 "Connected" 状态
+- [ ] 可以看到工具列表（通常 30+ 个工具）
+- [ ] 能成功执行一个测试工具（例如查询数据库版本）
+- [ ] 日志文件正常生成（`./logs/` 目录）
+
+### 故障排查
+
+如果连接失败，请按顺序检查：
+
+1. **检查 Node.js 版本**：
+   ```bash
+   node --version  # 必须 >= 18.0.0
+   ```
+
+2. **检查文件路径**：
+   ```bash
+   ls -la /path/to/starrocks-mcp.js  # 文件必须存在
+   ```
+
+3. **检查数据库连接**：
+   ```bash
+   mysql -h $DB_HOST -P $DB_PORT -u $DB_USER -p
+   ```
+
+4. **查看日志**：
+   ```bash
+   tail -f /path/to/starrocks-mcp-server/logs/starrocks-mcp-*.log
+   ```
+
+5. **手动测试 MCP Server**：
+   ```bash
+   cd /path/to/starrocks-mcp-server
+   node starrocks-mcp.js
+   # 应该启动并等待 MCP 协议输入
+   ```
+
+详细的故障排查步骤请参考 [完整安装指南](https://github.com/tracymacding/gemini-cli/blob/main/STARROCKS_EXPERT_完全安装指南.md)
 
 ## 📚 可用工具
 
