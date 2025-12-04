@@ -67,19 +67,6 @@ cd starrocks-mcp-server
 - 安装 npm 依赖
 - 生成配置文件模板
 
-#### 方法 2: 手动安装
-
-```bash
-# 安装依赖
-npm install
-
-# 复制配置文件
-cp .env.example .env
-
-# 编辑配置
-vim .env
-```
-
 ### 配置
 
 编辑 `.env` 文件，配置数据库连接和 API 地址：
