@@ -86,14 +86,20 @@ vim .env
 
 ```bash
 # StarRocks 数据库配置
-DB_HOST=127.0.0.1
-DB_PORT=9030
-DB_USER=root
-DB_PASSWORD=your_password
-DB_DATABASE=your_database
+SR_HOST=localhost
+SR_PORT=9030
+SR_USER=root
+SR_PASSWORD=
+SR_DATABASE=your_database
 
 # StarRocks Expert 中心 API（可选）
-CENTRAL_API=http://localhost:80
+CENTRAL_API=http://127.0.0.1:3002
+CENTRAL_API_TOKEN=your_api_token_here
+
+# Prometheus 配置（可选，用于缓存指标查询）
+PROMETHEUS_PROTOCOL=http
+PROMETHEUS_HOST=localhost
+PROMETHEUS_PORT=9092
 
 # DeepSeek API Key（可选，用于 LLM 分析）
 DEEPSEEK_API_KEY=your_deepseek_api_key
@@ -119,16 +125,21 @@ StarRocks MCP Server 支持任何实现了 MCP 协议的客户端。以下是主
 在配置任何客户端之前，请先准备以下信息：
 
 1. **StarRocks 数据库连接信息**:
-   - 主机地址 (`DB_HOST`): 例如 `127.0.0.1`
-   - 端口 (`DB_PORT`): 默认 `9030`
-   - 用户名 (`DB_USER`): 例如 `root`
-   - 密码 (`DB_PASSWORD`): 数据库密码
+   - 主机地址 (`SR_HOST`): 例如 `localhost`
+   - 端口 (`SR_PORT`): 默认 `9030`
+   - 用户名 (`SR_USER`): 例如 `root`
+   - 密码 (`SR_PASSWORD`): 数据库密码
 
 2. **StarRocks Expert 中心 API** (可选，用于高级分析):
-   - API 地址 (`CENTRAL_API`): 例如 `http://localhost:80`
+   - API 地址 (`CENTRAL_API`): 例如 `http://127.0.0.1:3002`
    - API Token (`CENTRAL_API_TOKEN`): 向管理员索取
 
-3. **MCP Server 安装路径**:
+3. **Prometheus 配置** (可选，用于缓存指标查询):
+   - 协议 (`PROMETHEUS_PROTOCOL`): `http` 或 `https`
+   - 主机地址 (`PROMETHEUS_HOST`): 例如 `localhost`
+   - 端口 (`PROMETHEUS_PORT`): 例如 `9092`
+
+4. **MCP Server 安装路径**:
    ```bash
    # 找到 starrocks-mcp.js 的完整路径
    cd /path/to/starrocks-mcp-server
@@ -187,12 +198,15 @@ nano ~/.gemini/settings.json
         "/path/to/starrocks-mcp-server/starrocks-mcp.js"
       ],
       "env": {
-        "DB_HOST": "127.0.0.1",
-        "DB_PORT": "9030",
-        "DB_USER": "root",
-        "DB_PASSWORD": "your_password",
-        "CENTRAL_API": "http://localhost:80",
-        "CENTRAL_API_TOKEN": "your_api_token_here"
+        "SR_HOST": "localhost",
+        "SR_USER": "root",
+        "SR_PASSWORD": "",
+        "SR_PORT": "9030",
+        "CENTRAL_API": "http://127.0.0.1:3002",
+        "CENTRAL_API_TOKEN": "your_api_token_here",
+        "PROMETHEUS_PROTOCOL": "http",
+        "PROMETHEUS_HOST": "localhost",
+        "PROMETHEUS_PORT": "9092"
       }
     }
   }
@@ -299,12 +313,15 @@ nano ~/.gemini/settings.json
         "/path/to/starrocks-mcp-server/starrocks-mcp.js"
       ],
       "env": {
-        "DB_HOST": "127.0.0.1",
-        "DB_PORT": "9030",
-        "DB_USER": "root",
-        "DB_PASSWORD": "your_password",
-        "CENTRAL_API": "http://localhost:80",
-        "CENTRAL_API_TOKEN": "your_api_token_here"
+        "SR_HOST": "localhost",
+        "SR_USER": "root",
+        "SR_PASSWORD": "",
+        "SR_PORT": "9030",
+        "CENTRAL_API": "http://127.0.0.1:3002",
+        "CENTRAL_API_TOKEN": "your_api_token_here",
+        "PROMETHEUS_PROTOCOL": "http",
+        "PROMETHEUS_HOST": "localhost",
+        "PROMETHEUS_PORT": "9092"
       }
     }
   }
@@ -316,12 +333,15 @@ nano ~/.gemini/settings.json
 | 参数 | 说明 | 示例 |
 |------|------|------|
 | `args[0]` | MCP Server 脚本的完整路径 | `/home/user/starrocks-mcp-server/starrocks-mcp.js` |
-| `DB_HOST` | StarRocks 数据库地址 | `127.0.0.1` 或 `192.168.1.100` |
-| `DB_PORT` | StarRocks 查询端口 | `9030` (默认) |
-| `DB_USER` | 数据库用户名 | `root` |
-| `DB_PASSWORD` | 数据库密码 | 留空或填写实际密码 |
-| `CENTRAL_API` | Expert 服务地址（可选） | `http://localhost:80` |
+| `SR_HOST` | StarRocks 数据库地址 | `localhost` 或 `192.168.1.100` |
+| `SR_PORT` | StarRocks 查询端口 | `9030` (默认) |
+| `SR_USER` | 数据库用户名 | `root` |
+| `SR_PASSWORD` | 数据库密码 | 留空或填写实际密码 |
+| `CENTRAL_API` | Expert 服务地址（可选） | `http://127.0.0.1:3002` |
 | `CENTRAL_API_TOKEN` | API 认证 Token（可选） | 向管理员索取 |
+| `PROMETHEUS_PROTOCOL` | Prometheus 协议 | `http` 或 `https` |
+| `PROMETHEUS_HOST` | Prometheus 地址 | `localhost` |
+| `PROMETHEUS_PORT` | Prometheus 端口 | `9092` |
 
 ##### 1B.5 验证配置
 
@@ -404,12 +424,15 @@ nano ~/Library/Application\ Support/Claude/claude_desktop_config.json
         "/path/to/starrocks-mcp-server/starrocks-mcp.js"
       ],
       "env": {
-        "DB_HOST": "127.0.0.1",
-        "DB_PORT": "9030",
-        "DB_USER": "root",
-        "DB_PASSWORD": "your_password",
-        "CENTRAL_API": "http://localhost:80",
-        "CENTRAL_API_TOKEN": "your_api_token"
+        "SR_HOST": "localhost",
+        "SR_USER": "root",
+        "SR_PASSWORD": "",
+        "SR_PORT": "9030",
+        "CENTRAL_API": "http://127.0.0.1:3002",
+        "CENTRAL_API_TOKEN": "your_api_token_here",
+        "PROMETHEUS_PROTOCOL": "http",
+        "PROMETHEUS_HOST": "localhost",
+        "PROMETHEUS_PORT": "9092"
       }
     }
   }
@@ -494,12 +517,15 @@ notepad "$env:USERPROFILE\.claude.json"
         "/path/to/starrocks-mcp-server/starrocks-mcp.js"
       ],
       "env": {
-        "DB_HOST": "127.0.0.1",
-        "DB_PORT": "9030",
-        "DB_USER": "root",
-        "DB_PASSWORD": "your_password",
-        "CENTRAL_API": "http://localhost:80",
-        "CENTRAL_API_TOKEN": "your_api_token_here"
+        "SR_HOST": "localhost",
+        "SR_USER": "root",
+        "SR_PASSWORD": "",
+        "SR_PORT": "9030",
+        "CENTRAL_API": "http://127.0.0.1:3002",
+        "CENTRAL_API_TOKEN": "your_api_token_here",
+        "PROMETHEUS_PROTOCOL": "http",
+        "PROMETHEUS_HOST": "localhost",
+        "PROMETHEUS_PORT": "9092"
       }
     }
   }
@@ -512,12 +538,15 @@ notepad "$env:USERPROFILE\.claude.json"
 |------|------|------|
 | `command` | 执行命令（通常是 `node`） | `node` |
 | `args[0]` | MCP Server 脚本的完整路径 | `/home/user/starrocks-mcp-server/starrocks-mcp.js` |
-| `DB_HOST` | StarRocks 数据库地址 | `127.0.0.1` |
-| `DB_PORT` | StarRocks 查询端口 | `9030` |
-| `DB_USER` | 数据库用户名 | `root` |
-| `DB_PASSWORD` | 数据库密码 | 留空或填写密码 |
-| `CENTRAL_API` | Expert 服务地址（可选） | `http://localhost:80` |
+| `SR_HOST` | StarRocks 数据库地址 | `localhost` |
+| `SR_PORT` | StarRocks 查询端口 | `9030` |
+| `SR_USER` | 数据库用户名 | `root` |
+| `SR_PASSWORD` | 数据库密码 | 留空或填写密码 |
+| `CENTRAL_API` | Expert 服务地址（可选） | `http://127.0.0.1:3002` |
 | `CENTRAL_API_TOKEN` | API Token（可选） | 向管理员索取 |
+| `PROMETHEUS_PROTOCOL` | Prometheus 协议 | `http` 或 `https` |
+| `PROMETHEUS_HOST` | Prometheus 地址 | `localhost` |
+| `PROMETHEUS_PORT` | Prometheus 端口 | `9092` |
 
 **查找 MCP Server 路径**：
 
@@ -592,12 +621,15 @@ cat ~/.claude.json
 cat ~/.claude.json | jq .
 
 # 手动测试 MCP Server 是否能启动
-export DB_HOST=127.0.0.1
-export DB_PORT=9030
-export DB_USER=root
-export DB_PASSWORD=
-export CENTRAL_API=http://localhost:80
+export SR_HOST=localhost
+export SR_PORT=9030
+export SR_USER=root
+export SR_PASSWORD=
+export CENTRAL_API=http://127.0.0.1:3002
 export CENTRAL_API_TOKEN=your_token
+export PROMETHEUS_PROTOCOL=http
+export PROMETHEUS_HOST=localhost
+export PROMETHEUS_PORT=9092
 
 node /path/to/starrocks-mcp-server/starrocks-mcp.js
 # 应该启动并等待输入
@@ -653,10 +685,15 @@ cat ~/.claude.json
         "/path/to/starrocks-mcp-server/starrocks-mcp.js"
       ],
       "env": {
-        "DB_HOST": "127.0.0.1",
-        "DB_PORT": "9030",
-        "DB_USER": "root",
-        "DB_PASSWORD": ""
+        "SR_HOST": "localhost",
+        "SR_USER": "root",
+        "SR_PASSWORD": "",
+        "SR_PORT": "9030",
+        "CENTRAL_API": "http://127.0.0.1:3002",
+        "CENTRAL_API_TOKEN": "your_api_token_here",
+        "PROMETHEUS_PROTOCOL": "http",
+        "PROMETHEUS_HOST": "localhost",
+        "PROMETHEUS_PORT": "9092"
       }
     }
   }
@@ -674,10 +711,15 @@ cat ~/.claude.json
   "command": "node",
   "args": ["/path/to/starrocks-mcp-server/starrocks-mcp.js"],
   "env": {
-    "DB_HOST": "127.0.0.1",
-    "DB_PORT": "9030",
-    "DB_USER": "root",
-    "DB_PASSWORD": "your_password"
+    "SR_HOST": "localhost",
+    "SR_USER": "root",
+    "SR_PASSWORD": "",
+    "SR_PORT": "9030",
+    "CENTRAL_API": "http://127.0.0.1:3002",
+    "CENTRAL_API_TOKEN": "your_api_token_here",
+    "PROMETHEUS_PROTOCOL": "http",
+    "PROMETHEUS_HOST": "localhost",
+    "PROMETHEUS_PORT": "9092"
   }
 }
 ```
@@ -710,7 +752,7 @@ cat ~/.claude.json
 
 3. **检查数据库连接**：
    ```bash
-   mysql -h $DB_HOST -P $DB_PORT -u $DB_USER -p
+   mysql -h $SR_HOST -P $SR_PORT -u $SR_USER -p
    ```
 
 4. **查看日志**：
@@ -812,7 +854,7 @@ node starrocks-mcp.js
 
 1. 测试数据库连接：
 ```bash
-mysql -h $DB_HOST -P $DB_PORT -u $DB_USER -p
+mysql -h $SR_HOST -P $SR_PORT -u $SR_USER -p
 ```
 
 2. 检查防火墙规则
