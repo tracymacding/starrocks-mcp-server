@@ -483,13 +483,40 @@ Claude 应该会显示所有可用的诊断工具。
 
 #### 3.3 验证配置
 
-1. 重启 VS Code
-2. 打开 Claude Code 面板
-3. 输入测试命令：
+1. **重启 VS Code**
 
-```
-检查 StarRocks MCP Server 的连接状态
-```
+2. **打开 Claude Code 面板**（以下任一方式）：
+
+   - **方式 1**: 使用快捷键
+     - Windows/Linux: `Ctrl+Shift+P`，输入 "Claude Code: Open Chat"
+     - macOS: `Cmd+Shift+P`，输入 "Claude Code: Open Chat"
+
+   - **方式 2**: 通过侧边栏图标
+     - 点击 VS Code 左侧活动栏中的 Claude Code 图标（通常是一个 AI 图标）
+
+   - **方式 3**: 通过菜单
+     - 顶部菜单 → View → Command Palette → 输入 "Claude Code: Open Chat"
+
+3. **验证 MCP Server 连接**：
+
+   在 Claude Code 面板中输入：
+
+   ```
+   检查 StarRocks MCP Server 的连接状态
+   ```
+
+   或者：
+
+   ```
+   列出所有可用的 MCP 工具
+   ```
+
+4. **预期结果**：
+
+   Claude Code 应该能够：
+   - ✅ 识别并连接到 StarRocks MCP Server
+   - ✅ 列出可用的工具（如 `analyze_storage_amplification`, `get_recent_slow_queries` 等）
+   - ✅ 执行 StarRocks 相关的诊断命令
 
 ---
 
