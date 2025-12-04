@@ -67,42 +67,6 @@ cd starrocks-mcp-server
 - 安装 npm 依赖
 - 生成配置文件模板
 
-### 配置
-
-编辑 `.env` 文件，配置数据库连接和 API 地址：
-
-```bash
-# StarRocks 数据库配置
-SR_HOST=localhost
-SR_PORT=9030
-SR_USER=root
-SR_PASSWORD=
-SR_DATABASE=your_database
-
-# StarRocks Expert 中心 API（可选）
-CENTRAL_API=http://127.0.0.1:3002
-CENTRAL_API_TOKEN=your_api_token_here
-
-# Prometheus 配置（可选，用于缓存指标查询）
-PROMETHEUS_PROTOCOL=http
-PROMETHEUS_HOST=localhost
-PROMETHEUS_PORT=9092
-
-# DeepSeek API Key（可选，用于 LLM 分析）
-DEEPSEEK_API_KEY=your_deepseek_api_key
-
-# 日志配置
-ENABLE_LOGGING=true
-```
-
-### 运行
-
-作为 MCP Server 运行（Stdio 模式）：
-
-```bash
-node starrocks-mcp.js
-```
-
 ## 🔌 MCP 客户端配置
 
 StarRocks MCP Server 支持任何实现了 MCP 协议的客户端。以下是主流客户端的详细配置指南。
