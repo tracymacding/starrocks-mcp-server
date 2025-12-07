@@ -605,6 +605,231 @@ class ThinMCPServer {
     if (loggingEnabled) {
       this.logger.logEnvironmentVariables();
     }
+
+    // 本地处理的 tools 列表（不需要中心服务器）
+    this.localTools = {
+      get_query_profile: true,  // get_query_profile 改为本地处理
+    };
+  }
+
+  /**
+   * 获取本地定义的 tools（不依赖中心服务器）
+   */
+  getLocalToolDefinitions() {
+    return [
+      {
+        name: 'get_query_profile',
+        description: '获取指定 Query ID 的执行 Profile，保存到本地文件并返回摘要信息。Profile 文件可用于后续详细分析。',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query_id: {
+              type: 'string',
+              description: 'Query ID，可以从 fe.audit.log 或 SHOW PROFILELIST 获取',
+            },
+          },
+          required: ['query_id'],
+        },
+      },
+    ];
+  }
+
+  /**
+   * 本地处理 get_query_profile
+   * 直接执行 SQL 获取 profile，写入本地文件，返回摘要
+   */
+  async handleGetQueryProfileLocally(args, requestId) {
+    const { query_id } = args;
+
+    if (!query_id) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: '❌ 错误: 缺少必需参数 query_id',
+          },
+        ],
+      };
+    }
+
+    let connection;
+    try {
+      console.error(`   [${requestId}] Connecting to database...`);
+      connection = await mysql.createConnection(this.dbConfig);
+
+      // 禁用当前 session 的 profile 记录
+      await connection.query("SET enable_profile = false");
+
+      // 执行 SQL 获取 profile
+      console.error(`   [${requestId}] Fetching profile for query_id: ${query_id}`);
+      const [rows] = await connection.query(
+        `SELECT get_query_profile('${query_id}') as profile`
+      );
+
+      if (!rows || rows.length === 0 || !rows[0].profile) {
+        // Profile 不存在，检查 enable_profile 配置
+        const [variables] = await connection.query("SHOW VARIABLES LIKE 'enable_profile'");
+        const profileEnabled = variables?.[0]?.Value === 'true' || variables?.[0]?.Value === '1';
+
+        let errorMsg = `❌ 无法获取 Query ID ${query_id} 的 Profile\n\n可能原因:\n`;
+        if (!profileEnabled) {
+          errorMsg += '1. ⚠️ Query Profile 当前未开启（建议: SET GLOBAL enable_profile = true）\n';
+        }
+        errorMsg += '2. Query ID 不存在或格式不正确\n';
+        errorMsg += '3. FE 已重启，Profile 数据丢失（Profile 仅存储在内存中）\n';
+        errorMsg += '4. Profile 已过期（内存保留时间有限）\n';
+        errorMsg += '5. Query 尚未执行完成';
+
+        return {
+          content: [{ type: 'text', text: errorMsg }],
+        };
+      }
+
+      const profile = rows[0].profile;
+
+      // 提取摘要信息
+      const summary = this.extractProfileSummary(profile);
+
+      // 写入本地文件
+      const profileDir = '/tmp/starrocks_profiles';
+      if (!fs.existsSync(profileDir)) {
+        fs.mkdirSync(profileDir, { recursive: true });
+      }
+      const filePath = path.join(profileDir, `profile_${query_id}.txt`);
+      fs.writeFileSync(filePath, profile, 'utf-8');
+      console.error(`   [${requestId}] Profile saved to: ${filePath}`);
+
+      // 构建返回结果
+      const resultText = this.formatProfileSummary(summary, filePath);
+
+      return {
+        content: [{ type: 'text', text: resultText }],
+      };
+
+    } catch (error) {
+      console.error(`   [${requestId}] Error:`, error.message);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `❌ 获取 Profile 失败: ${error.message}`,
+          },
+        ],
+      };
+    } finally {
+      if (connection) {
+        await connection.end();
+      }
+    }
+  }
+
+  /**
+   * 从 Profile 文本中提取摘要信息
+   */
+  extractProfileSummary(profileText) {
+    const summary = {
+      queryId: null,
+      startTime: null,
+      endTime: null,
+      duration: null,
+      queryState: null,
+      queryType: null,
+      defaultDb: null,
+      sqlStatement: null,
+      fragmentCount: 0,
+      peakMemory: null,
+      cpuTime: null,
+      scanTime: null,
+    };
+
+    // 提取 Query ID
+    const queryIdMatch = profileText.match(/Query ID:\s*([^\n]+)/);
+    if (queryIdMatch) summary.queryId = queryIdMatch[1].trim();
+
+    // 提取 Start Time
+    const startTimeMatch = profileText.match(/Start Time:\s*([^\n]+)/);
+    if (startTimeMatch) summary.startTime = startTimeMatch[1].trim();
+
+    // 提取 End Time
+    const endTimeMatch = profileText.match(/End Time:\s*([^\n]+)/);
+    if (endTimeMatch) summary.endTime = endTimeMatch[1].trim();
+
+    // 提取 Total Duration
+    const totalMatch = profileText.match(/Total:\s*([^\n]+)/);
+    if (totalMatch) summary.duration = totalMatch[1].trim();
+
+    // 提取 Query State
+    const stateMatch = profileText.match(/Query State:\s*([^\n]+)/);
+    if (stateMatch) summary.queryState = stateMatch[1].trim();
+
+    // 提取 Query Type
+    const typeMatch = profileText.match(/Query Type:\s*([^\n]+)/);
+    if (typeMatch) summary.queryType = typeMatch[1].trim();
+
+    // 提取 Default Db
+    const dbMatch = profileText.match(/Default Db:\s*([^\n]+)/);
+    if (dbMatch) summary.defaultDb = dbMatch[1].trim();
+
+    // 提取 SQL Statement（限制长度）
+    const sqlMatch = profileText.match(/Sql Statement:\s*([\s\S]*?)(?=\n\s+-\s+(?:Warehouse|Variables|NonDefault))/);
+    if (sqlMatch) {
+      let sql = sqlMatch[1].trim();
+      if (sql.length > 500) {
+        sql = sql.substring(0, 500) + '...';
+      }
+      summary.sqlStatement = sql;
+    }
+
+    // 统计 Fragment 数量
+    const fragmentMatches = profileText.match(/Fragment \d+:/g);
+    if (fragmentMatches) summary.fragmentCount = fragmentMatches.length;
+
+    // 提取 Peak Memory
+    const memMatch = profileText.match(/QueryPeakMemoryUsagePerNode:\s*([^\n]+)/);
+    if (memMatch) summary.peakMemory = memMatch[1].trim();
+
+    // 提取 CPU Time
+    const cpuMatch = profileText.match(/QueryCumulativeCpuTime:\s*([^\n]+)/);
+    if (cpuMatch) summary.cpuTime = cpuMatch[1].trim();
+
+    // 提取 Scan Time
+    const scanMatch = profileText.match(/QueryCumulativeScanTime:\s*([^\n]+)/);
+    if (scanMatch) summary.scanTime = scanMatch[1].trim();
+
+    return summary;
+  }
+
+  /**
+   * 格式化 Profile 摘要输出
+   */
+  formatProfileSummary(summary, filePath) {
+    let result = '📊 **Query Profile 摘要**\n\n';
+
+    result += '### 基本信息\n';
+    result += `- **Query ID**: ${summary.queryId || 'N/A'}\n`;
+    result += `- **状态**: ${summary.queryState || 'N/A'}\n`;
+    result += `- **类型**: ${summary.queryType || 'N/A'}\n`;
+    result += `- **数据库**: ${summary.defaultDb || 'N/A'}\n`;
+    result += `- **开始时间**: ${summary.startTime || 'N/A'}\n`;
+    result += `- **结束时间**: ${summary.endTime || 'N/A'}\n`;
+    result += `- **总耗时**: ${summary.duration || 'N/A'}\n`;
+
+    result += '\n### 资源使用\n';
+    result += `- **Fragment 数量**: ${summary.fragmentCount}\n`;
+    result += `- **峰值内存**: ${summary.peakMemory || 'N/A'}\n`;
+    result += `- **CPU 时间**: ${summary.cpuTime || 'N/A'}\n`;
+    result += `- **扫描时间**: ${summary.scanTime || 'N/A'}\n`;
+
+    if (summary.sqlStatement) {
+      result += '\n### SQL 语句\n';
+      result += '```sql\n' + summary.sqlStatement + '\n```\n';
+    }
+
+    result += '\n### Profile 文件\n';
+    result += `完整 Profile 已保存到: \`${filePath}\`\n\n`;
+    result += '💡 **提示**: 使用 Read 工具读取上述文件可查看完整 Profile 进行详细分析。\n';
+
+    return result;
   }
 
   /**
@@ -2344,7 +2569,18 @@ class ThinMCPServer {
 
     // 列出工具
     server.setRequestHandler(ListToolsRequestSchema, async () => {
-      const tools = await this.getToolsFromAPI();
+      // 获取远程 tools
+      const remoteTools = await this.getToolsFromAPI();
+      // 获取本地 tools
+      const localTools = this.getLocalToolDefinitions();
+
+      // 过滤掉远程 tools 中已在本地处理的 tools
+      const filteredRemoteTools = remoteTools.filter(
+        (tool) => !this.localTools[tool.name]
+      );
+
+      // 合并：本地 tools 优先
+      const tools = [...localTools, ...filteredRemoteTools];
       return { tools };
     });
 
@@ -2360,6 +2596,26 @@ class ThinMCPServer {
         console.error(`\n🔧 [${requestId}] Executing tool: ${toolName}`);
         console.error(`   Arguments:`, JSON.stringify(args).substring(0, 200));
 
+        // 检查是否是本地处理的 tool
+        if (this.localTools[toolName]) {
+          console.error(`   [Local] Processing ${toolName} locally...`);
+
+          let result;
+          switch (toolName) {
+            case 'get_query_profile':
+              result = await this.handleGetQueryProfileLocally(args, requestId);
+              break;
+            default:
+              result = {
+                content: [{ type: 'text', text: `Unknown local tool: ${toolName}` }],
+              };
+          }
+
+          console.error(`   [Local] Done processing ${toolName}`);
+          return result;
+        }
+
+        // 以下是远程处理流程（通过中心服务器）
         // 0. 处理文件路径参数（如果有的话）
         console.error('   Step 0: Processing file arguments...');
         const processedArgs = await this.processFileArgs(args);
