@@ -518,6 +518,46 @@ class Logger {
   }
 
   /**
+   * 记录 CLI 命令执行
+   */
+  logCliCommand(requestId, command, metadata = {}) {
+    this.write(
+      'INFO',
+      'CLI_COMMAND',
+      'Executing CLI command',
+      {
+        requestId,
+        command: command.substring(0, 500), // 限制命令长度
+        ...metadata,
+      },
+      true,
+    ); // skipSanitize=true 保留完整命令
+  }
+
+  /**
+   * 记录 CLI 命令结果
+   */
+  logCliResult(requestId, command, success, output, error, duration, metadata = {}) {
+    const level = success ? 'INFO' : 'ERROR';
+    const message = success ? 'CLI command succeeded' : 'CLI command failed';
+    this.write(
+      level,
+      'CLI_RESULT',
+      message,
+      {
+        requestId,
+        command: command.substring(0, 200), // 结果中命令简短显示
+        success,
+        output: output ? output.substring(0, 1000) : null, // CLI 输出可能较短，允许更多
+        error: error || null,
+        durationMs: duration,
+        ...metadata,
+      },
+      true,
+    );
+  }
+
+  /**
    * 记录环境变量
    */
   logEnvironmentVariables() {
@@ -1145,9 +1185,10 @@ class ThinMCPServer {
   /**
    * 执行 CLI 命令（用于对象存储空间查询等场景）
    * @param {Array} commands - CLI 命令列表
+   * @param {string} requestId - 请求 ID（用于日志记录）
    * @returns {Object} 执行结果
    */
-  async executeCliCommands(commands) {
+  async executeCliCommands(commands, requestId = null) {
     const { exec } = await import('node:child_process');
     const { promisify } = await import('node:util');
     const execAsync = promisify(exec);
@@ -1172,11 +1213,23 @@ class ThinMCPServer {
 
       const batchResults = await Promise.all(
         batch.map(async (cmd) => {
+          const cmdType = cmd.type || '';
+          const cmdKey = cmd.partition_key || cmd.table_key || cmd.path;
+
+          // 记录 CLI 命令到日志
+          if (requestId) {
+            this.logger.logCliCommand(requestId, cmd.command, {
+              type: cmdType,
+              key: cmdKey,
+              storageType: cmd.storage_type,
+            });
+          }
+
+          const cmdStartTime = Date.now();
           try {
             console.error(
               `   Executing CLI: ${cmd.command.substring(0, 80)}...`,
             );
-            const cmdStartTime = Date.now();
 
             const { stdout } = await execAsync(cmd.command, {
               timeout: commandTimeoutMs,
@@ -1186,9 +1239,14 @@ class ThinMCPServer {
             const duration = Date.now() - cmdStartTime;
 
             // 根据命令类型返回不同格式的结果
-            const cmdType = cmd.type || '';
-
             if (cmdType === 'ossutil_ls' || cmdType === 'aws_s3_ls') {
+              // 记录成功结果
+              if (requestId) {
+                this.logger.logCliResult(requestId, cmd.command, true, stdout, null, duration, {
+                  type: cmdType,
+                  key: cmdKey,
+                });
+              }
               // 列目录命令：返回原始输出
               return {
                 table_key: cmd.table_key,
@@ -1200,6 +1258,13 @@ class ThinMCPServer {
                 execution_time_ms: duration,
               };
             } else if (cmdType === 'get_size') {
+              // 记录成功结果
+              if (requestId) {
+                this.logger.logCliResult(requestId, cmd.command, true, stdout.trim(), null, duration, {
+                  type: cmdType,
+                  key: cmdKey,
+                });
+              }
               // 获取大小命令：返回原始输出供 expert 解析
               return {
                 table_key: cmd.table_key,
@@ -1216,6 +1281,14 @@ class ThinMCPServer {
                 cmd.storage_type || cmd.actual_storage_type,
                 stdout,
               );
+              // 记录成功结果
+              if (requestId) {
+                this.logger.logCliResult(requestId, cmd.command, sizeBytes !== null, stdout, null, duration, {
+                  type: cmdType,
+                  key: cmdKey,
+                  sizeBytes,
+                });
+              }
               return {
                 partition_key: cmd.partition_key,
                 path: cmd.path,
@@ -1226,10 +1299,18 @@ class ThinMCPServer {
               };
             }
           } catch (error) {
-            const cmdType = cmd.type || '';
+            const duration = Date.now() - cmdStartTime;
             console.error(
-              `   CLI failed for ${cmd.partition_key || cmd.table_key}: ${error.message}`,
+              `   CLI failed for ${cmdKey}: ${error.message}`,
             );
+
+            // 记录失败结果
+            if (requestId) {
+              this.logger.logCliResult(requestId, cmd.command, false, null, error.message, duration, {
+                type: cmdType,
+                key: cmdKey,
+              });
+            }
 
             if (cmdType === 'ossutil_ls' || cmdType === 'aws_s3_ls') {
               return {
@@ -1731,8 +1812,8 @@ class ThinMCPServer {
           break;
         }
         case 's3cmd': {
-          // s3cmd du 输出格式: "1234567890   123 objects s3://bucket/path/"
-          const match = stdout.match(/^(\d+)\s+\d+\s+objects?/m);
+          // s3cmd du 输出格式: "   1234567890   123 objects s3://bucket/path/" (可能有前导空格)
+          const match = stdout.match(/^\s*(\d+)\s+\d+\s+objects?/m);
           if (match) return parseInt(match[1], 10);
           // 空目录情况
           if (stdout.includes('0 objects')) return 0;
@@ -2749,6 +2830,7 @@ class ThinMCPServer {
             );
             const cliResults = await this.executeCliCommands(
               analysis.cli_commands,
+              requestId,
             );
 
             // 根据 phase 使用不同的结果键名
