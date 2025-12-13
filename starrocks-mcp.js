@@ -649,6 +649,7 @@ class ThinMCPServer {
     // 本地处理的 tools 列表（不需要中心服务器）
     this.localTools = {
       get_query_profile: true,  // get_query_profile 改为本地处理
+      analyze_load_profile: true,  // analyze_load_profile 本地处理（不需要数据库连接）
     };
   }
 
@@ -669,6 +670,24 @@ class ThinMCPServer {
             },
           },
           required: ['query_id'],
+        },
+      },
+      {
+        name: 'analyze_load_profile',
+        description: '📊 Load Profile 深度分析 - 分析本地 Load Profile 文件，使用 LLM 进行两阶段深度分析（瓶颈定位 + 根因分析）',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_path: {
+              type: 'string',
+              description: 'Load Profile 文件的本地路径',
+            },
+            profile_content: {
+              type: 'string',
+              description: 'Load Profile 的文本内容（直接提供，无需文件）',
+            },
+          },
+          required: [],
         },
       },
     ];
@@ -761,6 +780,134 @@ class ThinMCPServer {
         await connection.end();
       }
     }
+  }
+
+  /**
+   * 本地处理 analyze_load_profile
+   * 通过中心 API 分析 Load Profile（不需要数据库连接）
+   */
+  async handleAnalyzeLoadProfileLocally(args, requestId) {
+    const { file_path, profile_path, profile_content, profile } = args;
+    const filePath = file_path || profile_path;
+    let profileText = profile_content || profile;
+
+    // 如果没有直接提供内容，尝试从文件读取
+    if (!profileText && filePath) {
+      try {
+        console.error(`   [${requestId}] Reading Load Profile from: ${filePath}`);
+        profileText = fs.readFileSync(filePath, 'utf-8');
+        console.error(`   [${requestId}] Profile loaded: ${(profileText.length / 1024).toFixed(2)} KB`);
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `❌ 读取文件失败: ${error.message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    if (!profileText) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: '❌ 错误: 缺少必需参数 file_path 或 profile_content',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    try {
+      // 调用中心 API 进行分析
+      console.error(`   [${requestId}] Sending to Central API for analysis...`);
+      const analysis = await this.analyzeResultsWithAPI(
+        'analyze_load_profile',
+        {},
+        { profile_content: profileText, file_path: filePath },
+        requestId
+      );
+
+      // 格式化输出
+      const report = this.formatLoadProfileAnalysis(analysis);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: report,
+          },
+        ],
+      };
+    } catch (error) {
+      console.error(`   [${requestId}] Analysis failed:`, error.message);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `❌ 分析失败: ${error.message}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  /**
+   * 格式化 Load Profile 分析结果
+   */
+  formatLoadProfileAnalysis(analysis) {
+    if (analysis.status === 'error') {
+      return `❌ 分析失败: ${analysis.message}`;
+    }
+
+    let report = '';
+    report += '================================================================================\n';
+    report += '                     第一阶段：瓶颈定位与概括分析\n';
+    report += '================================================================================\n\n';
+
+    if (analysis.stage1_bottleneck) {
+      const b = analysis.stage1_bottleneck;
+      report += `【结构化结果】\n`;
+      report += `  瓶颈阶段: ${b.stage}\n`;
+      report += `  置信度:   ${b.confidence}\n`;
+      report += `  存在反压: ${b.is_backpressure ? '是' : '否'}\n`;
+      report += `  触发Spill: ${b.has_spill ? '是' : '否'}\n\n`;
+      report += `【概括性分析】\n${b.summary || '(无)'}\n\n`;
+    }
+
+    report += '================================================================================\n';
+    report += '                     第二阶段：深入分析与优化建议\n';
+    report += '================================================================================\n\n';
+
+    if (analysis.stage2_analysis) {
+      report += analysis.stage2_analysis + '\n\n';
+    }
+
+    if (analysis.profile_summary) {
+      report += '================================================================================\n';
+      report += '                            基础指标\n';
+      report += '================================================================================\n\n';
+      const s = analysis.profile_summary;
+      report += `总耗时: ${s.total_time || 'N/A'}\n`;
+      report += `扫描数据量: ${s.scan_bytes || 'N/A'}\n`;
+      report += `吞吐量: ${s.throughput?.bytesPerSecondFormatted || 'N/A'}\n\n`;
+    }
+
+    if (analysis.tokens) {
+      report += '================================================================================\n';
+      report += '                            Token 统计\n';
+      report += '================================================================================\n\n';
+      report += `第一阶段: ${analysis.tokens.stage1 || 'N/A'}\n`;
+      report += `第二阶段: ${analysis.tokens.stage2 || 'N/A'}\n`;
+      report += `总计: ${analysis.tokens.total || 'N/A'}\n`;
+    }
+
+    return report;
   }
 
   /**
@@ -2685,6 +2832,9 @@ class ThinMCPServer {
           switch (toolName) {
             case 'get_query_profile':
               result = await this.handleGetQueryProfileLocally(args, requestId);
+              break;
+            case 'analyze_load_profile':
+              result = await this.handleAnalyzeLoadProfileLocally(args, requestId);
               break;
             default:
               result = {
