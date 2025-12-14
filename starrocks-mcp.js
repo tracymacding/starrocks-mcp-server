@@ -650,6 +650,7 @@ class ThinMCPServer {
     this.localTools = {
       get_query_profile: true,  // get_query_profile 改为本地处理
       analyze_load_profile: true,  // analyze_load_profile 本地处理（不需要数据库连接）
+      check_disk_io: true,  // check_disk_io 本地处理（查询本地 Prometheus）
     };
   }
 
@@ -688,6 +689,29 @@ class ThinMCPServer {
             },
           },
           required: [],
+        },
+      },
+      {
+        name: 'check_disk_io',
+        description: '🔍 检查磁盘 IO 利用率 - 查询 Prometheus 获取指定时间范围内 BE 节点 Spill 磁盘的 IO 利用率，用于诊断导入性能瓶颈',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            start_time: {
+              type: 'string',
+              description: '开始时间，ISO 8601 格式（如 2025-12-13T16:53:20）',
+            },
+            end_time: {
+              type: 'string',
+              description: '结束时间，ISO 8601 格式（如 2025-12-13T17:14:26）',
+            },
+            be_addresses: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'BE 节点 IP 地址列表（可选，不指定则查询所有节点）',
+            },
+          },
+          required: ['start_time', 'end_time'],
         },
       },
     ];
@@ -1017,6 +1041,451 @@ class ThinMCPServer {
     result += '💡 **提示**: 使用 Read 工具读取上述文件可查看完整 Profile 进行详细分析。\n';
 
     return result;
+  }
+
+  /**
+   * 本地处理 check_disk_io
+   * 查询 Prometheus 获取指定时间范围的磁盘 IO 利用率
+   * 只查询 BE 节点 spill_local_storage_dir 对应的磁盘
+   */
+  async handleCheckDiskIOLocally(args, requestId) {
+    const { start_time, end_time, be_addresses } = args;
+
+    // 验证必需参数
+    if (!start_time || !end_time) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: '❌ 错误: 缺少必需参数 start_time 或 end_time',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    try {
+      // 解析时间为 Unix 时间戳
+      const startTs = Math.floor(new Date(start_time).getTime() / 1000);
+      const endTs = Math.floor(new Date(end_time).getTime() / 1000);
+
+      if (isNaN(startTs) || isNaN(endTs)) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: '❌ 错误: 时间格式无效，请使用 ISO 8601 格式（如 2025-12-12T07:12:46）',
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      console.error(`   [${requestId}] Checking disk IO for Spill storage...`);
+      console.error(`   Time range: ${start_time} to ${end_time}`);
+      console.error(`   BE addresses: ${be_addresses?.join(', ') || 'all'}`);
+
+      // Step 1: 查询 BE 配置获取 spill_local_storage_dir
+      console.error(`   [${requestId}] Step 1: Querying BE spill_local_storage_dir config...`);
+      const spillConfigs = await this.getSpillStorageConfigs(be_addresses);
+
+      if (spillConfigs.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: '⚠️ 未找到 BE 的 spill_local_storage_dir 配置\n\n可能原因:\n1. BE 节点不可用\n2. 没有配置 spill_local_storage_dir',
+            },
+          ],
+        };
+      }
+
+      // Step 2: 通过 SSH 获取 spill 目录对应的磁盘设备
+      console.error(`   [${requestId}] Step 2: Detecting disk devices via SSH...`);
+      const diskDevices = await this.detectSpillDiskDevices(spillConfigs, requestId);
+
+      if (diskDevices.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: '⚠️ 无法检测 Spill 存储对应的磁盘设备\n\n可能原因:\n1. SSH 连接失败\n2. spill_local_storage_dir 路径不存在',
+            },
+          ],
+        };
+      }
+
+      console.error(`   [${requestId}] Detected Spill disk devices: ${diskDevices.map(d => `${d.beIp}(${d.hostname}):${d.device}`).join(', ')}`);
+
+      // 将 diskDevices 数组转换为 hostname -> device 映射
+      const diskDeviceMap = {};
+      for (const d of diskDevices) {
+        diskDeviceMap[d.hostname] = d.device;
+        diskDeviceMap[d.beIp] = d.device;
+        const config = spillConfigs.find(c => c.beIp === d.beIp);
+        if (config) {
+          config.diskDevice = d.device;
+          config.hostname = d.hostname;
+        }
+      }
+
+      // Step 3: 自动检测 Prometheus scrape_interval
+      console.error(`   [${requestId}] Step 3: Detecting Prometheus scrape_interval...`);
+      const { step, rateWindow, scrapeInterval } = await this.getPrometheusScrapeInterval(requestId);
+
+      // Step 4: 查询 Prometheus 获取对应磁盘的 IO
+      console.error(`   [${requestId}] Step 4: Querying Prometheus for disk IO...`);
+      const baseUrl = `${this.prometheusConfig.protocol}://${this.prometheusConfig.host}:${this.prometheusConfig.port}`;
+
+      const ioUtilQuery = `rate(node_disk_io_time_seconds_total[${rateWindow}]) * 100`;
+      const expectedDataPoints = Math.floor((endTs - startTs) / scrapeInterval);
+      console.error(`   [${requestId}] Duration: ${endTs - startTs}s, step: ${step}, rateWindow: ${rateWindow}, expected data points: ~${expectedDataPoints}`);
+
+      const params = new URLSearchParams({
+        query: ioUtilQuery,
+        start: startTs.toString(),
+        end: endTs.toString(),
+        step: step,
+      });
+
+      const response = await fetch(`${baseUrl}/api/v1/query_range?${params}`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      if (!response.ok) {
+        throw new Error(`Prometheus API error: ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      if (data.status !== 'success') {
+        throw new Error(`Prometheus query failed: ${data.error || 'unknown error'}`);
+      }
+
+      const results = data.data?.result || [];
+
+      if (results.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `⚠️ 未找到磁盘 IO 数据\n\n可能原因:\n1. Node Exporter 未部署或未配置\n2. 时间范围内没有数据\n3. Prometheus 未收集 node_disk_io_time_seconds_total 指标`,
+            },
+          ],
+        };
+      }
+
+      // Step 5: 分析结果（只保留 Spill 磁盘）
+      const analysis = this.analyzeDiskIOResults(results, be_addresses, diskDeviceMap);
+
+      // 格式化输出
+      const report = this.formatDiskIOReport(analysis, start_time, end_time, spillConfigs);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: report,
+          },
+        ],
+      };
+
+    } catch (error) {
+      console.error(`   [${requestId}] Error:`, error.message);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `❌ 查询磁盘 IO 失败: ${error.message}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  /**
+   * 自动检测 Prometheus 的 scrape_interval
+   */
+  async getPrometheusScrapeInterval(requestId) {
+    const baseUrl = `${this.prometheusConfig.protocol}://${this.prometheusConfig.host}:${this.prometheusConfig.port}`;
+
+    try {
+      const response = await fetch(`${baseUrl}/api/v1/targets`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      if (!response.ok) {
+        console.error(`   [${requestId}] Failed to get Prometheus targets: ${response.status}`);
+        return { step: '15s', rateWindow: '45s', scrapeInterval: 15 };
+      }
+
+      const data = await response.json();
+      if (data.status !== 'success') {
+        return { step: '15s', rateWindow: '45s', scrapeInterval: 15 };
+      }
+
+      const activeTargets = data.data?.activeTargets || [];
+      let scrapeInterval = null;
+
+      for (const target of activeTargets) {
+        const jobName = target.labels?.job || '';
+        if (jobName.toLowerCase().includes('node') ||
+            target.scrapePool?.toLowerCase().includes('node')) {
+          const intervalStr = target.scrapeInterval || '';
+          scrapeInterval = this.parsePrometheusDuration(intervalStr);
+          if (scrapeInterval > 0) {
+            console.error(`   [${requestId}] Detected node_exporter scrape_interval: ${intervalStr} (${scrapeInterval}s)`);
+            break;
+          }
+        }
+      }
+
+      if (!scrapeInterval || scrapeInterval <= 0) {
+        scrapeInterval = 15;
+        console.error(`   [${requestId}] Using default scrape_interval: 15s`);
+      }
+
+      const step = `${scrapeInterval}s`;
+      const rateWindow = `${scrapeInterval * 3}s`;
+
+      return { step, rateWindow, scrapeInterval };
+
+    } catch (error) {
+      console.error(`   [${requestId}] Error detecting scrape_interval:`, error.message);
+      return { step: '15s', rateWindow: '45s', scrapeInterval: 15 };
+    }
+  }
+
+  /**
+   * 解析 Prometheus 时间间隔字符串（返回秒数）
+   */
+  parsePrometheusDuration(durationStr) {
+    if (!durationStr) return 0;
+    const match = durationStr.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d|w|y)$/);
+    if (!match) return 0;
+    const value = parseFloat(match[1]);
+    const unit = match[2];
+    switch (unit) {
+      case 'ms': return value / 1000;
+      case 's': return value;
+      case 'm': return value * 60;
+      case 'h': return value * 3600;
+      default: return 0;
+    }
+  }
+
+  /**
+   * 查询 BE 的 spill_local_storage_dir 配置
+   */
+  async getSpillStorageConfigs(beAddresses) {
+    const connection = await mysql.createConnection(this.dbConfig);
+    try {
+      let nodesMap = {};
+      try {
+        const [backends] = await connection.query('SHOW BACKENDS');
+        for (const be of backends) {
+          nodesMap[be.BackendId || be.Id] = be.IP || be.Host;
+        }
+      } catch (e) { /* ignore */ }
+
+      if (Object.keys(nodesMap).length === 0) {
+        try {
+          const [computeNodes] = await connection.query('SHOW COMPUTE NODES');
+          for (const cn of computeNodes) {
+            nodesMap[cn.ComputeNodeId || cn.Id] = cn.IP || cn.Host;
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      const [spillRows] = await connection.query(`
+        SELECT BE_ID, VALUE as spill_path
+        FROM information_schema.be_configs
+        WHERE NAME = 'spill_local_storage_dir'
+      `);
+
+      let configs = [];
+      for (const row of spillRows) {
+        const beIp = nodesMap[row.BE_ID];
+        if (beIp && row.spill_path) {
+          configs.push({
+            beId: row.BE_ID,
+            beIp: beIp,
+            spillPath: row.spill_path,
+          });
+        }
+      }
+
+      if (beAddresses && beAddresses.length > 0) {
+        configs = configs.filter(c => beAddresses.includes(c.beIp));
+      }
+
+      return configs;
+    } finally {
+      await connection.end();
+    }
+  }
+
+  /**
+   * 通过 SSH 检测 spill 目录对应的磁盘设备
+   */
+  async detectSpillDiskDevices(spillConfigs, requestId) {
+    const sshCommands = spillConfigs.map(config => ({
+      node_ip: config.beIp,
+      node_type: 'BE',
+      ssh_command: `echo "$(df "${config.spillPath}" 2>/dev/null | tail -1 | awk '{print $1}')|$(hostname)"`,
+    }));
+
+    const sshResults = await this.executeSshCommands(sshCommands, {}, requestId);
+
+    const devices = [];
+    for (const result of sshResults.ssh_results) {
+      if (result.success && result.output) {
+        const parts = result.output.trim().split('|');
+        const devicePath = parts[0] || '';
+        const hostname = parts[1] || '';
+
+        const match = devicePath.match(/\/dev\/([a-z]+)/);
+        if (match) {
+          devices.push({
+            beIp: result.node_ip,
+            hostname: hostname,
+            devicePath: devicePath,
+            device: match[1],
+            spillPath: spillConfigs.find(c => c.beIp === result.node_ip)?.spillPath,
+          });
+        }
+      }
+    }
+
+    return devices;
+  }
+
+  /**
+   * 分析磁盘 IO 查询结果
+   */
+  analyzeDiskIOResults(results, beAddresses, diskDevices = null) {
+    const analysis = {
+      devices: [],
+      summary: {
+        maxIOUtil: 0,
+        avgIOUtil: 0,
+        highIOCount: 0,
+        totalDataPoints: 0,
+      },
+    };
+
+    for (const result of results) {
+      const metric = result.metric || {};
+      const values = result.values || [];
+      const instance = metric.instance || 'unknown';
+      const device = metric.device || 'unknown';
+
+      if (device.startsWith('loop') || device.startsWith('dm-')) {
+        continue;
+      }
+
+      const instanceHost = instance.split(':')[0];
+
+      if (diskDevices && Object.keys(diskDevices).length > 0) {
+        const spillDeviceNames = Object.values(diskDevices);
+        const spillDevice = diskDevices[instanceHost];
+
+        if (spillDevice) {
+          if (device !== spillDevice) continue;
+        } else {
+          if (!spillDeviceNames.includes(device)) continue;
+        }
+      } else if (beAddresses && beAddresses.length > 0) {
+        if (!beAddresses.includes(instanceHost)) continue;
+      }
+
+      const ioValues = values.map(v => parseFloat(v[1])).filter(v => !isNaN(v));
+      if (ioValues.length === 0) continue;
+
+      const maxIO = Math.max(...ioValues);
+      const avgIO = ioValues.reduce((a, b) => a + b, 0) / ioValues.length;
+      const highIOCount = ioValues.filter(v => v > 80).length;
+
+      analysis.devices.push({
+        instance,
+        device,
+        maxIOUtil: maxIO.toFixed(2),
+        avgIOUtil: avgIO.toFixed(2),
+        highIOCount,
+        dataPoints: ioValues.length,
+      });
+
+      analysis.summary.maxIOUtil = Math.max(analysis.summary.maxIOUtil, maxIO);
+      analysis.summary.totalDataPoints += ioValues.length;
+      analysis.summary.highIOCount += highIOCount;
+    }
+
+    if (analysis.devices.length > 0) {
+      const totalAvg = analysis.devices.reduce((sum, d) => sum + parseFloat(d.avgIOUtil), 0);
+      analysis.summary.avgIOUtil = (totalAvg / analysis.devices.length).toFixed(2);
+    }
+
+    analysis.devices.sort((a, b) => parseFloat(b.maxIOUtil) - parseFloat(a.maxIOUtil));
+    return analysis;
+  }
+
+  /**
+   * 格式化磁盘 IO 报告
+   */
+  formatDiskIOReport(analysis, startTime, endTime, spillConfigs = null) {
+    let report = '';
+    report += '================================================================================\n';
+    report += '                        📈 磁盘 IO 利用率分析报告（Spill 磁盘）\n';
+    report += '================================================================================\n\n';
+
+    report += `📅 时间范围: ${startTime} ~ ${endTime}\n\n`;
+
+    if (spillConfigs && spillConfigs.length > 0) {
+      report += '【Spill 存储配置】\n';
+      for (const config of spillConfigs) {
+        const hostInfo = config.hostname ? ` (${config.hostname})` : '';
+        const deviceInfo = config.diskDevice ? ` → 磁盘: ${config.diskDevice}` : '';
+        report += `   ${config.beIp}${hostInfo}: ${config.spillPath}${deviceInfo}\n`;
+      }
+      report += '\n';
+    }
+
+    report += '【汇总】\n';
+    report += `   最大 IO 利用率: ${analysis.summary.maxIOUtil.toFixed(2)}%\n`;
+    report += `   平均 IO 利用率: ${analysis.summary.avgIOUtil}%\n`;
+    report += `   高负载次数 (>80%): ${analysis.summary.highIOCount}\n`;
+    report += `   监控设备数: ${analysis.devices.length}\n\n`;
+
+    const maxIO = analysis.summary.maxIOUtil;
+    if (maxIO > 90) {
+      report += '🔴 **磁盘 IO 利用率极高，存在严重瓶颈！**\n\n';
+    } else if (maxIO > 70) {
+      report += '🟡 **磁盘 IO 利用率较高，可能存在瓶颈**\n\n';
+    } else {
+      report += '✅ **磁盘 IO 利用率正常，未检测到明显瓶颈**\n\n';
+    }
+
+    if (analysis.devices.length > 0) {
+      report += '【各设备详情】\n';
+      report += '┌──────────────────────────────┬──────────┬──────────┬──────────┬────────────┐\n';
+      report += '│ 实例/设备                     │ 最大(%)  │ 平均(%)  │ 高负载次数│ 数据点数   │\n';
+      report += '├──────────────────────────────┼──────────┼──────────┼──────────┼────────────┤\n';
+
+      for (const d of analysis.devices) {
+        const instDev = `${d.instance.split(':')[0]}/${d.device}`.padEnd(28);
+        const maxVal = d.maxIOUtil.padStart(6);
+        const avgVal = d.avgIOUtil.padStart(6);
+        const highCount = String(d.highIOCount).padStart(6);
+        const dataPoints = String(d.dataPoints).padStart(8);
+        report += `│ ${instDev} │ ${maxVal}   │ ${avgVal}   │ ${highCount}   │ ${dataPoints}   │\n`;
+      }
+
+      report += '└──────────────────────────────┴──────────┴──────────┴──────────┴────────────┘\n';
+    }
+
+    return report;
   }
 
   /**
@@ -2835,6 +3304,9 @@ class ThinMCPServer {
               break;
             case 'analyze_load_profile':
               result = await this.handleAnalyzeLoadProfileLocally(args, requestId);
+              break;
+            case 'check_disk_io':
+              result = await this.handleCheckDiskIOLocally(args, requestId);
               break;
             default:
               result = {
