@@ -70,262 +70,18 @@ cd starrocks-mcp-server
 
 StarRocks MCP Server 支持任何实现了 MCP 协议的客户端。以下是主流客户端的详细配置指南。
 
-### 方式 1: Gemini CLI 配置
-
-[Gemini CLI](https://github.com/google-gemini/gemini-cli) 是 Google 官方的命令行工具，原生支持 MCP 协议。根据是否需要使用 DeepSeek 作为 LLM 提供商，有两种配置方式：
-
-#### 方式 1A: 原生 Gemini CLI（仅支持 Google Gemini）
-
-如果你只需要使用 Google Gemini API，可以安装原生版本。
-
-##### 1A.1 安装原生 Gemini CLI
-
-**官方文档**: [Gemini CLI Installation](https://geminicli.com/docs/get-started/installation/)
-
-```bash
-# 全局安装 Gemini CLI
-npm install -g @google/gemini-cli
-
-# 验证安装
-gemini --version
-```
-
-**参考资源**:
-- NPM 包: [@google/gemini-cli](https://www.npmjs.com/package/@google/gemini-cli)
-- GitHub: [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli)
-
-##### 1A.2 配置 Google Gemini API Key
-
-```bash
-# 设置 API Key（从 https://aistudio.google.com/apikey 获取）
-export GOOGLE_API_KEY="your-google-api-key-here"
-
-# 或添加到 shell 配置文件
-echo 'export GOOGLE_API_KEY="your-google-api-key-here"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-##### 1A.3 配置 MCP Server
-
-创建或编辑 `~/.gemini/settings.json` 文件：
-
-```bash
-mkdir -p ~/.gemini
-nano ~/.gemini/settings.json
-```
-
-添加以下配置（**根据实际情况修改路径和连接信息**）：
-
-```json
-{
-  "mcpServers": {
-    "starrocks-expert": {
-      "command": "node",
-      "args": [
-        "/path/to/starrocks-mcp-server/starrocks-mcp.js"
-      ],
-      "env": {
-        "SR_HOST": "localhost",
-        "SR_USER": "root",
-        "SR_PASSWORD": "",
-        "SR_PORT": "9030",
-        "CENTRAL_API": "http://127.0.0.1:3002",
-        "CENTRAL_API_TOKEN": "your_api_token_here",
-        "PROMETHEUS_PROTOCOL": "http",
-        "PROMETHEUS_HOST": "localhost",
-        "PROMETHEUS_PORT": "9092"
-      }
-    }
-  }
-}
-```
-
-##### 1A.4 验证配置
-
-```bash
-# 启动 Gemini CLI
-gemini
-
-# 检查 MCP 连接状态
-> /mcp list
-
-# 预期输出：
-# ✓ starrocks-expert: node .../starrocks-mcp.js (stdio) - Connected
-#   Tools: 34
-
-# 测试工具
-> 帮我查看 StarRocks 的存储健康状况
-```
-
-**注意**：原生 Gemini CLI 仅支持 Google Gemini API，不支持 DeepSeek 等其他 LLM 提供商。如需使用 DeepSeek，请使用方式 1B。
-
----
-
-#### 方式 1B: 定制版 Gemini CLI（支持 DeepSeek，推荐）
-
-[定制版 Gemini CLI](https://github.com/tracymacding/gemini-cli) 扩展了原生版本，**支持 DeepSeek 等多种 LLM 提供商**，成本更低且性能优秀。
-
-##### 1B.1 安装定制版 Gemini CLI
-
-```bash
-# 克隆定制版 Gemini CLI 项目
-git clone https://github.com/tracymacding/gemini-cli.git
-cd gemini-cli
-
-# 安装依赖
-npm install
-
-# 构建项目
-npm run build
-
-# 全局链接（方便直接使用 gemini 命令）
-npm link
-```
-
-##### 1B.2 验证安装
-
-```bash
-gemini --version
-# 应该显示版本号，例如: 0.8.0
-```
-
-##### 1B.3 配置 DeepSeek API Key
-
-**DeepSeek 优势**：
-- ✅ 比 Google Gemini 便宜约 90%（¥1/百万 tokens 输入）
-- ✅ 性能优秀（DeepSeek-V3）
-- ✅ 中文支持更好
-
-**方式 A: 使用 .env 文件（推荐）**
-
-```bash
-cd gemini-cli
-
-# 创建 .env 文件
-cat > .env <<'EOF'
-# DeepSeek API Key
-# 获取地址: https://platform.deepseek.com/
-DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
-EOF
-```
-
-**方式 B: 设置环境变量**
-
-```bash
-# 临时设置（当前终端有效）
-export DEEPSEEK_API_KEY="sk-your-deepseek-api-key-here"
-
-# 永久设置（添加到 shell 配置）
-echo 'export DEEPSEEK_API_KEY="sk-your-deepseek-api-key-here"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-##### 1B.4 配置 MCP Server
-
-创建或编辑 `~/.gemini/settings.json` 文件：
-
-```bash
-mkdir -p ~/.gemini
-nano ~/.gemini/settings.json
-```
-
-添加以下配置（**根据实际情况修改路径和连接信息**）：
-
-```json
-{
-  "mcpServers": {
-    "starrocks-expert": {
-      "command": "node",
-      "args": [
-        "/path/to/starrocks-mcp-server/starrocks-mcp.js"
-      ],
-      "env": {
-        "SR_HOST": "localhost",
-        "SR_USER": "root",
-        "SR_PASSWORD": "",
-        "SR_PORT": "9030",
-        "CENTRAL_API": "http://127.0.0.1:3002",
-        "CENTRAL_API_TOKEN": "your_api_token_here",
-        "PROMETHEUS_PROTOCOL": "http",
-        "PROMETHEUS_HOST": "localhost",
-        "PROMETHEUS_PORT": "9092"
-      }
-    }
-  }
-}
-```
-
-**配置说明**：
-
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `args[0]` | MCP Server 脚本的完整路径 | `/home/user/starrocks-mcp-server/starrocks-mcp.js` |
-| `SR_HOST` | StarRocks 数据库地址 | `localhost` 或 `192.168.1.100` |
-| `SR_PORT` | StarRocks 查询端口 | `9030` (默认) |
-| `SR_USER` | 数据库用户名 | `root` |
-| `SR_PASSWORD` | 数据库密码 | 留空或填写实际密码 |
-| `CENTRAL_API` | Expert 服务地址（可选） | `http://127.0.0.1:3002` |
-| `CENTRAL_API_TOKEN` | API 认证 Token（可选） | 向管理员索取 |
-| `PROMETHEUS_PROTOCOL` | Prometheus 协议 | `http` 或 `https` |
-| `PROMETHEUS_HOST` | Prometheus 地址 | `localhost` |
-| `PROMETHEUS_PORT` | Prometheus 端口 | `9092` |
-
-##### 1B.5 验证配置
-
-**使用启动脚本（推荐）**：
-
-```bash
-cd gemini-cli
-./start-gemini-cli.sh
-```
-
-**或手动启动**：
-
-```bash
-# 启动 Gemini CLI 并使用 DeepSeek
-gemini --provider deepseek -m deepseek-chat
-
-# 检查 MCP 连接状态
-> /mcp list
-
-# 预期输出：
-# ✓ starrocks-expert: node .../starrocks-mcp.js (stdio) - Connected
-#   Tools: 34
-
-# 查看可用工具
-> /tools
-
-# 测试工具
-> 帮我分析 StarRocks 的存储健康状况
-```
-
-**预期输出示例**：
-
-```
-🤖 启动 Gemini CLI (DeepSeek + MCP)
-====================================
-
-✅ 已加载 .env 配置
-✅ DeepSeek API Key: sk-76b76...
-📡 检查中心 API 服务器...
-   ✅ API 服务器运行正常
-🔧 检查 MCP 配置...
-   ✅ MCP 服务器已连接
-
-🚀 启动 Gemini CLI...
-
-💡 使用的功能:
-   • DeepSeek 模型 (deepseek-chat)
-   • MCP 工具 (StarRocks 诊断)
-```
-
----
-
-### 方式 2: Claude Code CLI 配置
+### 方式 1: Claude Code CLI 配置（⭐ 强烈推荐）
 
 [Claude Code](https://claude.ai/claude-code) 是 Anthropic 官方的命令行 AI 编程工具，原生支持 MCP 协议。
 
-#### 2.1 安装 Claude Code CLI
+**为什么强烈推荐 Claude Code**：
+- ✅ **最强的代码能力**：Claude 在代码理解和生成方面表现卓越
+- ✅ **原生 MCP 支持**：无需额外配置即可使用 MCP 工具
+- ✅ **支持 DeepSeek**：可配置使用 DeepSeek 模型，大幅降低成本
+- ✅ **交互体验好**：流式输出、多轮对话、上下文保持
+- ✅ **跨平台支持**：macOS、Linux、Windows 全平台支持
+
+#### 1.1 安装 Claude Code CLI
 
 **快速安装**：
 
@@ -355,7 +111,7 @@ claude --version
 claude
 ```
 
-#### 2.2 配置 MCP Server
+#### 1.2 配置 MCP Server
 
 **配置文件位置**：`~/.claude.json`
 
@@ -423,7 +179,86 @@ pwd
 # 输出完整路径，例如: /home/user/starrocks-mcp-server
 ```
 
-#### 2.3 验证配置
+#### 1.3 使用 DeepSeek 模型（可选，推荐）
+
+Claude Code 默认使用 Anthropic Claude 模型，但你也可以配置使用 **DeepSeek** 作为后端模型，成本更低且中文支持更好。
+
+**DeepSeek 优势**：
+- ✅ 成本低廉（约 ¥1/百万 tokens 输入，比 Claude 便宜 90%+）
+- ✅ DeepSeek-V3 性能优秀
+- ✅ 中文理解和生成能力强
+- ✅ 官方支持 Anthropic API 兼容格式
+
+**参考文档**：[DeepSeek Anthropic API 兼容](https://api-docs.deepseek.com/zh-cn/guides/anthropic_api)
+
+##### 配置方式
+
+**方式 A: 设置环境变量（推荐）**
+
+```bash
+# 添加到 shell 配置文件（~/.bashrc 或 ~/.zshrc）
+cat >> ~/.bashrc <<'EOF'
+
+# DeepSeek 配置 for Claude Code
+export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+export ANTHROPIC_AUTH_TOKEN=sk-your-deepseek-api-key-here  # 替换为你的 DeepSeek API Key
+export ANTHROPIC_MODEL=deepseek-chat
+export API_TIMEOUT_MS=600000  # 防止长输出超时
+EOF
+
+# 使配置生效
+source ~/.bashrc
+```
+
+**方式 B: 启动时设置**
+
+```bash
+# 每次启动 Claude Code 时设置
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic \
+ANTHROPIC_AUTH_TOKEN=sk-your-deepseek-api-key \
+ANTHROPIC_MODEL=deepseek-chat \
+API_TIMEOUT_MS=600000 \
+claude
+```
+
+**获取 DeepSeek API Key**：
+
+1. 访问 [DeepSeek 开放平台](https://platform.deepseek.com/)
+2. 注册/登录账号
+3. 进入 API Keys 页面创建新的 API Key
+4. 复制 API Key（格式为 `sk-xxxxxxxx`）
+
+##### DeepSeek 支持的功能
+
+| 功能 | 支持情况 |
+|------|---------|
+| max_tokens | ✅ 支持 |
+| stop_sequences | ✅ 支持 |
+| stream | ✅ 支持 |
+| system prompts | ✅ 支持 |
+| temperature (0.0-2.0) | ✅ 支持 |
+| top_p | ✅ 支持 |
+| tool use (MCP 工具调用) | ✅ 支持 |
+| thinking mode | ✅ 支持 |
+| 图片内容 | ❌ 不支持 |
+| 文档类型 | ❌ 不支持 |
+
+##### 验证 DeepSeek 配置
+
+```bash
+# 启动 Claude Code
+claude
+
+# 如果配置正确，Claude Code 会使用 DeepSeek 模型
+# 可以通过询问模型来验证
+> 你是什么模型？
+
+# DeepSeek 会回复类似：我是 DeepSeek...
+```
+
+**注意**：使用 DeepSeek 时，部分 Claude 特有功能（如图片分析）将不可用，但对于代码编写和 StarRocks 诊断等文本任务完全够用。
+
+#### 1.4 验证配置
 
 1. **启动 Claude Code CLI**：
 
@@ -470,7 +305,7 @@ pwd
    - ✅ 执行 SQL 查询并返回分析结果
    - ✅ 提供专业的诊断建议
 
-#### 2.4 故障排查
+#### 1.5 故障排查
 
 **问题 1**: 提示 "MCP Server not found" 或 "Connection failed"
 
@@ -522,6 +357,257 @@ ls -la ~/.claude.json
 
 # 查看配置文件内容
 cat ~/.claude.json
+```
+
+---
+
+### 方式 2: Gemini CLI 配置
+
+[Gemini CLI](https://github.com/google-gemini/gemini-cli) 是 Google 官方的命令行工具，原生支持 MCP 协议。根据是否需要使用 DeepSeek 作为 LLM 提供商，有两种配置方式：
+
+#### 方式 2A: 原生 Gemini CLI（仅支持 Google Gemini）
+
+如果你只需要使用 Google Gemini API，可以安装原生版本。
+
+##### 2A.1 安装原生 Gemini CLI
+
+**官方文档**: [Gemini CLI Installation](https://geminicli.com/docs/get-started/installation/)
+
+```bash
+# 全局安装 Gemini CLI
+npm install -g @google/gemini-cli
+
+# 验证安装
+gemini --version
+```
+
+**参考资源**:
+- NPM 包: [@google/gemini-cli](https://www.npmjs.com/package/@google/gemini-cli)
+- GitHub: [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli)
+
+##### 2A.2 配置 Google Gemini API Key
+
+```bash
+# 设置 API Key（从 https://aistudio.google.com/apikey 获取）
+export GOOGLE_API_KEY="your-google-api-key-here"
+
+# 或添加到 shell 配置文件
+echo 'export GOOGLE_API_KEY="your-google-api-key-here"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+##### 2A.3 配置 MCP Server
+
+创建或编辑 `~/.gemini/settings.json` 文件：
+
+```bash
+mkdir -p ~/.gemini
+nano ~/.gemini/settings.json
+```
+
+添加以下配置（**根据实际情况修改路径和连接信息**）：
+
+```json
+{
+  "mcpServers": {
+    "starrocks-expert": {
+      "command": "node",
+      "args": [
+        "/path/to/starrocks-mcp-server/starrocks-mcp.js"
+      ],
+      "env": {
+        "SR_HOST": "localhost",
+        "SR_USER": "root",
+        "SR_PASSWORD": "",
+        "SR_PORT": "9030",
+        "CENTRAL_API": "http://127.0.0.1:3002",
+        "CENTRAL_API_TOKEN": "your_api_token_here",
+        "PROMETHEUS_PROTOCOL": "http",
+        "PROMETHEUS_HOST": "localhost",
+        "PROMETHEUS_PORT": "9092"
+      }
+    }
+  }
+}
+```
+
+##### 2A.4 验证配置
+
+```bash
+# 启动 Gemini CLI
+gemini
+
+# 检查 MCP 连接状态
+> /mcp list
+
+# 预期输出：
+# ✓ starrocks-expert: node .../starrocks-mcp.js (stdio) - Connected
+#   Tools: 34
+
+# 测试工具
+> 帮我查看 StarRocks 的存储健康状况
+```
+
+**注意**：原生 Gemini CLI 仅支持 Google Gemini API，不支持 DeepSeek 等其他 LLM 提供商。如需使用 DeepSeek，请使用方式 2B。
+
+---
+
+#### 方式 2B: 定制版 Gemini CLI（支持 DeepSeek，推荐）
+
+[定制版 Gemini CLI](https://github.com/tracymacding/gemini-cli) 扩展了原生版本，**支持 DeepSeek 等多种 LLM 提供商**，成本更低且性能优秀。
+
+##### 2B.1 安装定制版 Gemini CLI
+
+```bash
+# 克隆定制版 Gemini CLI 项目
+git clone https://github.com/tracymacding/gemini-cli.git
+cd gemini-cli
+
+# 安装依赖
+npm install
+
+# 构建项目
+npm run build
+
+# 全局链接（方便直接使用 gemini 命令）
+npm link
+```
+
+##### 2B.2 验证安装
+
+```bash
+gemini --version
+# 应该显示版本号，例如: 0.8.0
+```
+
+##### 2B.3 配置 DeepSeek API Key
+
+**DeepSeek 优势**：
+- ✅ 比 Google Gemini 便宜约 90%（¥1/百万 tokens 输入）
+- ✅ 性能优秀（DeepSeek-V3）
+- ✅ 中文支持更好
+
+**方式 A: 使用 .env 文件（推荐）**
+
+```bash
+cd gemini-cli
+
+# 创建 .env 文件
+cat > .env <<'EOF'
+# DeepSeek API Key
+# 获取地址: https://platform.deepseek.com/
+DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
+EOF
+```
+
+**方式 B: 设置环境变量**
+
+```bash
+# 临时设置（当前终端有效）
+export DEEPSEEK_API_KEY="sk-your-deepseek-api-key-here"
+
+# 永久设置（添加到 shell 配置）
+echo 'export DEEPSEEK_API_KEY="sk-your-deepseek-api-key-here"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+##### 2B.4 配置 MCP Server
+
+创建或编辑 `~/.gemini/settings.json` 文件：
+
+```bash
+mkdir -p ~/.gemini
+nano ~/.gemini/settings.json
+```
+
+添加以下配置（**根据实际情况修改路径和连接信息**）：
+
+```json
+{
+  "mcpServers": {
+    "starrocks-expert": {
+      "command": "node",
+      "args": [
+        "/path/to/starrocks-mcp-server/starrocks-mcp.js"
+      ],
+      "env": {
+        "SR_HOST": "localhost",
+        "SR_USER": "root",
+        "SR_PASSWORD": "",
+        "SR_PORT": "9030",
+        "CENTRAL_API": "http://127.0.0.1:3002",
+        "CENTRAL_API_TOKEN": "your_api_token_here",
+        "PROMETHEUS_PROTOCOL": "http",
+        "PROMETHEUS_HOST": "localhost",
+        "PROMETHEUS_PORT": "9092"
+      }
+    }
+  }
+}
+```
+
+**配置说明**：
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `args[0]` | MCP Server 脚本的完整路径 | `/home/user/starrocks-mcp-server/starrocks-mcp.js` |
+| `SR_HOST` | StarRocks 数据库地址 | `localhost` 或 `192.168.1.100` |
+| `SR_PORT` | StarRocks 查询端口 | `9030` (默认) |
+| `SR_USER` | 数据库用户名 | `root` |
+| `SR_PASSWORD` | 数据库密码 | 留空或填写实际密码 |
+| `CENTRAL_API` | Expert 服务地址（可选） | `http://127.0.0.1:3002` |
+| `CENTRAL_API_TOKEN` | API 认证 Token（可选） | 向管理员索取 |
+| `PROMETHEUS_PROTOCOL` | Prometheus 协议 | `http` 或 `https` |
+| `PROMETHEUS_HOST` | Prometheus 地址 | `localhost` |
+| `PROMETHEUS_PORT` | Prometheus 端口 | `9092` |
+
+##### 2B.5 验证配置
+
+**使用启动脚本（推荐）**：
+
+```bash
+cd gemini-cli
+./start-gemini-cli.sh
+```
+
+**或手动启动**：
+
+```bash
+# 启动 Gemini CLI 并使用 DeepSeek
+gemini --provider deepseek -m deepseek-chat
+
+# 检查 MCP 连接状态
+> /mcp list
+
+# 预期输出：
+# ✓ starrocks-expert: node .../starrocks-mcp.js (stdio) - Connected
+#   Tools: 34
+
+# 查看可用工具
+> /tools
+
+# 测试工具
+> 帮我分析 StarRocks 的存储健康状况
+```
+
+**预期输出示例**：
+
+```
+🤖 启动 Gemini CLI (DeepSeek + MCP)
+====================================
+
+✅ 已加载 .env 配置
+✅ DeepSeek API Key: sk-76b76...
+📡 检查中心 API 服务器...
+   ✅ API 服务器运行正常
+🔧 检查 MCP 配置...
+   ✅ MCP 服务器已连接
+
+🚀 启动 Gemini CLI...
+
+💡 使用的功能:
+   • DeepSeek 模型 (deepseek-chat)
+   • MCP 工具 (StarRocks 诊断)
 ```
 
 ---
