@@ -623,6 +623,10 @@ class ThinMCPServer {
     this.cacheTime = null;
     this.cacheTTL = 3600000; // 1小时缓存
 
+    // 会话存储（用于分步执行时保存中间结果）
+    this.sessionStorage = new Map();
+    this.sessionTTL = 3600000; // 会话数据保留1小时
+
     console.error('🤖 Thin MCP Server initialized');
     console.error(`   Central API: ${this.centralAPI}`);
     console.error(`   Database: ${this.dbConfig.host}:${this.dbConfig.port}`);
@@ -652,6 +656,64 @@ class ThinMCPServer {
       analyze_load_profile: true,  // analyze_load_profile 本地处理（不需要数据库连接）
       check_disk_io: true,  // check_disk_io 本地处理（查询本地 Prometheus）
     };
+  }
+
+  /**
+   * 生成会话 ID
+   */
+  generateSessionId(toolName) {
+    return `${toolName}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  }
+
+  /**
+   * 存储会话数据
+   */
+  storeSession(sessionId, data) {
+    this.sessionStorage.set(sessionId, {
+      data,
+      timestamp: Date.now(),
+    });
+    // 清理过期会话
+    this.cleanExpiredSessions();
+    console.error(`   💾 会话已存储: ${sessionId}`);
+  }
+
+  /**
+   * 获取会话数据
+   */
+  getSession(sessionId) {
+    const session = this.sessionStorage.get(sessionId);
+    if (!session) {
+      console.error(`   ❌ 会话不存在: ${sessionId}`);
+      return null;
+    }
+    if (Date.now() - session.timestamp > this.sessionTTL) {
+      this.sessionStorage.delete(sessionId);
+      console.error(`   ⏰ 会话已过期: ${sessionId}`);
+      return null;
+    }
+    console.error(`   📂 会话已恢复: ${sessionId}`);
+    return session.data;
+  }
+
+  /**
+   * 删除会话
+   */
+  deleteSession(sessionId) {
+    this.sessionStorage.delete(sessionId);
+    console.error(`   🗑️ 会话已删除: ${sessionId}`);
+  }
+
+  /**
+   * 清理过期会话
+   */
+  cleanExpiredSessions() {
+    const now = Date.now();
+    for (const [sessionId, session] of this.sessionStorage.entries()) {
+      if (now - session.timestamp > this.sessionTTL) {
+        this.sessionStorage.delete(sessionId);
+      }
+    }
   }
 
   /**
@@ -1488,6 +1550,7 @@ class ThinMCPServer {
     return report;
   }
 
+
   /**
    * 从中心 API 获取工具列表
    */
@@ -1530,6 +1593,93 @@ class ThinMCPServer {
 
       // 返回空列表
       return [];
+    }
+  }
+
+  /**
+   * 递归调用 Solution C 工具（用于工具间调用）
+   * 执行完整的工具处理流程：获取查询 -> 执行 SQL -> 分析结果
+   */
+  async handleSolutionCTool(toolName, args = {}, requestId = null) {
+    console.error(`   [Tool-to-Tool] Calling ${toolName}...`);
+    console.error(`   [Tool-to-Tool] Received args: ${JSON.stringify(args)}`);
+    console.error(`   [Tool-to-Tool] context_lines = ${args.context_lines}`);
+    // DEBUG: 写入日志文件
+    fs.appendFileSync('/tmp/mcp-debug.log', `\n[${new Date().toISOString()}] handleSolutionCTool(${toolName})\n  args: ${JSON.stringify(args)}\n  context_lines: ${args.context_lines}\n`);
+
+    try {
+      // 1. 从中心 API 获取 SQL 查询定义
+      const queryDef = await this.getQueriesFromAPI(toolName, args, requestId);
+      console.error(`   [Tool-to-Tool] Got ${queryDef.queries.length} queries`);
+
+      // 2. 执行 SQL 查询
+      let results = {};
+      const regularQueries = queryDef.queries.filter(q => q.type !== 'meta');
+      if (regularQueries.length > 0) {
+        results = await this.executeQueries(regularQueries, requestId);
+      }
+
+      // 3. 发送给中心 API 分析（支持多阶段）
+      let analysis = await this.analyzeResultsWithAPI(
+        toolName,
+        results,
+        args,
+        requestId,
+      );
+
+      // 4. 处理多阶段查询
+      let phaseCount = 1;
+      const maxPhases = 5;
+      while (analysis.status === 'needs_more_queries' && phaseCount < maxPhases) {
+        phaseCount++;
+        console.error(`   [Tool-to-Tool] Phase ${phaseCount}: ${analysis.phase}`);
+
+        // 执行 SSH 命令（如果需要）
+        if (analysis.requires_ssh_execution && analysis.ssh_commands) {
+          const sshResults = await this.executeSshCommands(
+            analysis.ssh_commands,
+            args,
+            requestId,
+          );
+
+          // 根据 phase 存储结果
+          if (analysis.phase === 'discover_log_paths') {
+            results.discovered_log_paths = sshResults.ssh_results;
+          } else if (analysis.phase === 'fetch_logs') {
+            results.log_contents = sshResults.ssh_results;
+          } else {
+            results = { ...results, ...sshResults };
+          }
+        }
+
+        // 执行额外的 SQL 查询（如果需要）
+        if (analysis.next_queries && analysis.next_queries.length > 0) {
+          const additionalResults = await this.executeQueries(
+            analysis.next_queries,
+            requestId,
+          );
+          results = { ...results, ...additionalResults };
+        }
+
+        // 重新分析
+        const nextArgs = analysis.next_args || args;
+        analysis = await this.analyzeResultsWithAPI(
+          toolName,
+          results,
+          nextArgs,
+          requestId,
+        );
+      }
+
+      console.error(`   [Tool-to-Tool] ${toolName} completed with status: ${analysis.status}`);
+      return analysis;
+    } catch (error) {
+      console.error(`   [Tool-to-Tool] ${toolName} failed: ${error.message}`);
+      return {
+        status: 'error',
+        error: error.message,
+        tool: toolName,
+      };
     }
   }
 
@@ -2050,82 +2200,15 @@ class ThinMCPServer {
               );
             }
 
-            const cmdStartTime = Date.now();
-
-            const { stdout, stderr } = await execAsync(fullCmd, {
-              timeout: commandTimeoutMs,
-              maxBuffer: 50 * 1024 * 1024, // 50MB（日志可能较大）
-            });
-
-            const duration = Date.now() - cmdStartTime;
-
-            // 记录 SSH 命令结果到日志文件
-            if (requestId) {
-              this.logger.logSshResult(
-                requestId,
-                nodeIp,
-                cmd.node_type,
-                true,
-                stdout,
-                stderr,
-                null,
-                duration,
-              );
-            }
-
-            // 根据命令类型处理结果
+            // 根据命令类型选择执行方式
             const commandType = cmd.command_type || 'generic';
+            fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] command_type: ${commandType}, cmd keys: ${Object.keys(cmd).join(',')}\n`);
 
-            if (commandType === 'discover_log_path') {
-              // 发现日志路径
-              return {
-                node_ip: nodeIp,
-                node_type: cmd.node_type,
-                command_type: commandType,
-                success: true,
-                output: stdout.trim(),
-                execution_time_ms: duration,
-              };
-            } else if (commandType === 'fetch_log') {
-              // 获取日志内容
-              let content = stdout;
-              // 如果是压缩的，解压
-              if (cmd.options?.compress) {
-                try {
-                  const decoded = Buffer.from(stdout.trim(), 'base64');
-                  const { gunzipSync } = await import('node:zlib');
-                  content = gunzipSync(decoded).toString('utf-8');
-                } catch (decompressErr) {
-                  console.error(
-                    `   Warning: Failed to decompress log from ${nodeIp}: ${decompressErr.message}`,
-                  );
-                  content = stdout; // 使用原始输出
-                }
-              }
-
-              // 解析多文件格式: === FILE: filename ===
-              const files = this.parseMultiFileLogContent(
-                content,
-                nodeIp,
-                cmd.node_type,
-              );
-
-              return {
-                node_ip: nodeIp,
-                node_type: cmd.node_type,
-                log_dir: cmd.log_dir,
-                file_patterns: cmd.file_patterns,
-                command_type: commandType,
-                ssh_command: remoteCmd, // 保留原始 SSH 命令用于调试
-                success: true,
-                files: files, // 解析后的文件列表
-                total_files: files.length,
-                total_lines: files.reduce((sum, f) => sum + f.line_count, 0),
-                execution_time_ms: duration,
-              };
-            } else if (commandType === 'fetch_log_scp') {
+            // fetch_log_scp 使用 spawn 流式传输，需要单独处理
+            if (commandType === 'fetch_log_scp') {
               // 使用流式传输避免 maxBuffer 限制
               // SSH 输出直接流式写入本地临时文件，然后读取解压
+              const cmdStartTime = Date.now();
               const tmpDir = os.tmpdir();
               const tmpFile = path.join(
                 tmpDir,
@@ -2148,10 +2231,19 @@ class ThinMCPServer {
               sshArgs.push(`${sshUser}@${nodeIp}`, remoteCmd);
 
               // 使用 spawn 流式执行，输出写入临时文件
+              fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] sshKeyPath: "${sshKeyPath}"\n`);
+              fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] SSH args: ssh ${sshArgs.slice(0, -1).join(' ')} "<cmd>"\n`);
+              // 写入完整命令到单独文件以便分析
+              fs.writeFileSync('/tmp/mcp_remote_cmd.sh', remoteCmd);
+
               await new Promise((resolve, reject) => {
                 const writeStream = fs.createWriteStream(tmpFile);
                 const sshProcess = spawn('ssh', sshArgs);
 
+                let stdoutBytes = 0;
+                sshProcess.stdout.on('data', (chunk) => {
+                  stdoutBytes += chunk.length;
+                });
                 sshProcess.stdout.pipe(writeStream);
 
                 let stderrData = '';
@@ -2160,6 +2252,7 @@ class ThinMCPServer {
                 });
 
                 writeStream.on('finish', () => {
+                  fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] writeStream finish, exitCode: ${sshProcess.exitCode}, stdoutBytes: ${stdoutBytes}\n`);
                   if (
                     sshProcess.exitCode === 0 ||
                     sshProcess.exitCode === null
@@ -2169,6 +2262,7 @@ class ThinMCPServer {
                 });
 
                 sshProcess.on('close', (code) => {
+                  fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] SSH close, code: ${code}, stderr: ${stderrData.substring(0, 200)}\n`);
                   writeStream.end();
                   if (code === 0) {
                     resolve();
@@ -2226,11 +2320,14 @@ class ThinMCPServer {
               }
 
               // 解析多文件格式: === FILE: filename ===
+              fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] Compressed: ${compressedSize}, Decompressed: ${content.length}\n`);
+              fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] Content preview: ${content.substring(0, 300).replace(/\n/g, '\\n')}\n`);
               const files = this.parseMultiFileLogContent(
                 content,
                 nodeIp,
                 cmd.node_type,
               );
+              fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] Parsed ${files.length} files\n`);
 
               return {
                 node_ip: nodeIp,
@@ -2245,6 +2342,79 @@ class ThinMCPServer {
                 total_lines: files.reduce((sum, f) => sum + f.line_count, 0),
                 compressed_size: compressedSize,
                 decompressed_size: content.length,
+                execution_time_ms: duration,
+              };
+            }
+
+            // 其他命令类型使用 execAsync
+            const cmdStartTime = Date.now();
+
+            const { stdout, stderr } = await execAsync(fullCmd, {
+              timeout: commandTimeoutMs,
+              maxBuffer: 50 * 1024 * 1024, // 50MB（日志可能较大）
+            });
+
+            const duration = Date.now() - cmdStartTime;
+
+            // 记录 SSH 命令结果到日志文件
+            if (requestId) {
+              this.logger.logSshResult(
+                requestId,
+                nodeIp,
+                cmd.node_type,
+                true,
+                stdout,
+                stderr,
+                null,
+                duration,
+              );
+            }
+
+            if (commandType === 'discover_log_path') {
+              // 发现日志路径
+              return {
+                node_ip: nodeIp,
+                node_type: cmd.node_type,
+                command_type: commandType,
+                success: true,
+                output: stdout.trim(),
+                execution_time_ms: duration,
+              };
+            } else if (commandType === 'fetch_log') {
+              // 获取日志内容
+              let content = stdout;
+              // 如果是压缩的，解压
+              if (cmd.options?.compress) {
+                try {
+                  const decoded = Buffer.from(stdout.trim(), 'base64');
+                  const { gunzipSync } = await import('node:zlib');
+                  content = gunzipSync(decoded).toString('utf-8');
+                } catch (decompressErr) {
+                  console.error(
+                    `   Warning: Failed to decompress log from ${nodeIp}: ${decompressErr.message}`,
+                  );
+                  content = stdout; // 使用原始输出
+                }
+              }
+
+              // 解析多文件格式: === FILE: filename ===
+              const files = this.parseMultiFileLogContent(
+                content,
+                nodeIp,
+                cmd.node_type,
+              );
+
+              return {
+                node_ip: nodeIp,
+                node_type: cmd.node_type,
+                log_dir: cmd.log_dir,
+                file_patterns: cmd.file_patterns,
+                command_type: commandType,
+                ssh_command: remoteCmd, // 保留原始 SSH 命令用于调试
+                success: true,
+                files: files, // 解析后的文件列表
+                total_files: files.length,
+                total_lines: files.reduce((sum, f) => sum + f.line_count, 0),
                 execution_time_ms: duration,
               };
             } else {
@@ -3083,11 +3253,17 @@ class ThinMCPServer {
       status,
       architecture_type,
       report,
+      content,
     } = analysis;
 
     // 如果 analysis 已经包含格式化的 report，直接使用
     if (report && typeof report === 'string') {
       return report;
+    }
+
+    // 如果 analysis 已经包含格式化的 content（如发布耗时分析报告），直接使用
+    if (content && typeof content === 'string') {
+      return content;
     }
 
     let formattedReport = '';
@@ -3102,6 +3278,32 @@ class ThinMCPServer {
     if (status === 'error') {
       formattedReport =
         '❌ 分析失败: ' + (analysis.error || analysis.message) + '\n';
+      return formattedReport;
+    }
+
+    // 处理 plan 模式：返回执行计划，指示 Claude 创建 TODO
+    if (status === 'plan' && analysis.plan) {
+      formattedReport = '📋 执行计划\n\n';
+      formattedReport += `${analysis.message || '即将执行以下步骤：'}\n\n`;
+      formattedReport += `${analysis.plan.description || ''}\n\n`;
+
+      if (analysis.plan.steps && analysis.plan.steps.length > 0) {
+        formattedReport += '步骤列表：\n';
+        for (const step of analysis.plan.steps) {
+          formattedReport += `  ${step.step}. ${step.name}`;
+          if (step.description) {
+            formattedReport += ` - ${step.description}`;
+          }
+          formattedReport += '\n';
+        }
+        formattedReport += '\n';
+      }
+
+      if (analysis.next_action) {
+        formattedReport += '⚠️ 重要：请先使用 TodoWrite 工具创建上述步骤的 TODO 列表，然后再次调用本工具并传入 execute: true 参数开始执行。\n\n';
+        formattedReport += `下次调用参数: ${JSON.stringify(analysis.next_action.call_with)}\n`;
+      }
+
       return formattedReport;
     }
 
@@ -3249,6 +3451,115 @@ class ThinMCPServer {
   }
 
   /**
+   * 格式化步骤完成报告
+   * @param {Object} analysis - 分析结果
+   * @param {string} sessionId - 会话 ID（用于恢复中间状态）
+   */
+  formatStepCompletedReport(analysis, sessionId = null) {
+    let report = '';
+    const step = analysis.completed_step || {};
+
+    report += `✅ 步骤 ${step.step || '?'} 完成: ${step.name || analysis.phase || '未知步骤'}\n\n`;
+
+    if (step.result_summary) {
+      report += `📊 执行结果:\n${step.result_summary}\n\n`;
+    }
+
+    // 展示详细结果（如果有）
+    if (step.result_details) {
+      report += `📋 详细信息:\n`;
+      if (step.result_details.description) {
+        report += `${step.result_details.description}\n\n`;
+      }
+
+      // 格式化事务详情（步骤2）
+      if (step.result_details.transactions && step.result_details.transactions.length > 0) {
+        report += `┌────────────┬────────────────────────────────┬──────────────┬──────────────┬──────────────┐\n`;
+        report += `│ TXN ID     │ Label                          │ Publish(ms)  │ Wait(ms)     │ RPC(ms)      │\n`;
+        report += `├────────────┼────────────────────────────────┼──────────────┼──────────────┼──────────────┤\n`;
+        for (const txn of step.result_details.transactions.slice(0, 10)) {
+          const txnId = String(txn.txn_id || '').padEnd(10).substring(0, 10);
+          const label = String(txn.label || 'N/A').padEnd(30).substring(0, 30);
+          const publish = String(txn.publish_total_cost_ms || 0).padStart(12);
+          const wait = String(txn.wait_for_publish_cost_ms || 0).padStart(12);
+          const rpc = String(txn.publish_rpc_cost_ms || 0).padStart(12);
+          report += `│ ${txnId} │ ${label} │ ${publish} │ ${wait} │ ${rpc} │\n`;
+        }
+        report += `└────────────┴────────────────────────────────┴──────────────┴──────────────┴──────────────┘\n\n`;
+      }
+
+      // 格式化表元数据（步骤3）
+      if (step.result_details.tables && step.result_details.tables.length > 0) {
+        report += `┌────────────┬────────────────────────────────────────┬──────────────────┬──────────┐\n`;
+        report += `│ Table ID   │ Table Name                             │ Table Model      │ Buckets  │\n`;
+        report += `├────────────┼────────────────────────────────────────┼──────────────────┼──────────┤\n`;
+        for (const table of step.result_details.tables) {
+          const tableId = String(table.table_id || '').padEnd(10).substring(0, 10);
+          const tableName = String(table.table_name || 'N/A').padEnd(38).substring(0, 38);
+          const tableModel = String(table.table_model || 'N/A').padEnd(16).substring(0, 16);
+          const buckets = String(table.buckets || 'N/A').padStart(8);
+          report += `│ ${tableId} │ ${tableName} │ ${tableModel} │ ${buckets} │\n`;
+        }
+        report += `└────────────┴────────────────────────────────────────┴──────────────────┴──────────┘\n\n`;
+      }
+
+      // 格式化 CN 日志详情（步骤4）
+      if (step.result_details.cn_logs && step.result_details.cn_logs.length > 0) {
+        report += `┌────────────┬──────────────┬──────────────┬─────────────────────────────────────────────────┐\n`;
+        report += `│ TXN ID     │ CN Cost(ms)  │ Tablets      │ 日志预览                                        │\n`;
+        report += `├────────────┼──────────────┼──────────────┼─────────────────────────────────────────────────┤\n`;
+        for (const cn of step.result_details.cn_logs) {
+          const txnId = String(cn.txn_id || '').padEnd(10).substring(0, 10);
+          const cnCost = String(cn.cn_cost_ms || 'N/A').padStart(12);
+          const tablets = String(cn.tablets_count || 0).padStart(12);
+          const preview = String(cn.raw_log_preview || '').substring(0, 45).padEnd(47);
+          report += `│ ${txnId} │ ${cnCost} │ ${tablets} │ ${preview} │\n`;
+        }
+        report += `└────────────┴──────────────┴──────────────┴─────────────────────────────────────────────────┘\n\n`;
+      }
+
+      // 格式化 FE vs CN 对比（步骤4）
+      if (step.result_details.fe_vs_cn_comparison && step.result_details.fe_vs_cn_comparison.length > 0) {
+        report += `FE vs CN 耗时对比:\n`;
+        report += `┌────────────┬──────────────────┬──────────────────┬──────────────────┐\n`;
+        report += `│ TXN ID     │ FE RPC(ms)       │ CN 实际(ms)      │ 网络延迟(ms)     │\n`;
+        report += `├────────────┼──────────────────┼──────────────────┼──────────────────┤\n`;
+        for (const cmp of step.result_details.fe_vs_cn_comparison) {
+          const txnId = String(cmp.txn_id || '').padEnd(10).substring(0, 10);
+          const feRpc = String(cmp.fe_publish_rpc_ms || 0).padStart(16);
+          const cnCost = String(cmp.cn_actual_cost_ms || '0.00').padStart(16);
+          const network = String(cmp.estimated_network_latency_ms || '0.00').padStart(16);
+          report += `│ ${txnId} │ ${feRpc} │ ${cnCost} │ ${network} │\n`;
+        }
+        report += `└────────────┴──────────────────┴──────────────────┴──────────────────┘\n\n`;
+      }
+
+      // 展示备注
+      if (step.result_details.note) {
+        report += `💡 ${step.result_details.note}\n\n`;
+      }
+    }
+
+    if (analysis.next_step) {
+      report += `⏭️ 下一步: 步骤 ${analysis.next_step.step} - ${analysis.next_step.name}\n`;
+      report += `   ${analysis.next_step.description || ''}\n\n`;
+    }
+
+    report += `⚠️ 请更新 TODO 列表（将步骤 ${step.step} 标记为完成），然后再次调用本工具继续执行。\n`;
+
+    if (analysis.next_action && analysis.next_action.call_with) {
+      // 确保 session_id 在参数中
+      const callWith = { ...analysis.next_action.call_with };
+      if (sessionId && !callWith.session_id) {
+        callWith.session_id = sessionId;
+      }
+      report += `\n📝 下次调用参数:\n\`\`\`json\n${JSON.stringify(callWith, null, 2)}\n\`\`\`\n`;
+    }
+
+    return report;
+  }
+
+  /**
    * 启动服务器
    */
   async start() {
@@ -3282,8 +3593,27 @@ class ThinMCPServer {
     });
 
     // 执行工具
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const { name: toolName, arguments: args } = request.params;
+
+      // 进度通知辅助函数
+      const sendProgress = (progress, total, message) => {
+        if (extra && extra.sendNotification) {
+          try {
+            extra.sendNotification({
+              method: 'notifications/progress',
+              params: {
+                progressToken: request.id,
+                progress,
+                total,
+                message,
+              },
+            });
+          } catch (e) {
+            console.error(`   [Progress] Failed to send progress: ${e.message}`);
+          }
+        }
+      };
 
       // 生成请求 ID 并记录客户端请求
       const requestId = this.logger.generateRequestId();
@@ -3324,6 +3654,16 @@ class ThinMCPServer {
         const processedArgs = await this.processFileArgs(args);
         console.error('   File processing completed');
 
+        // 0.5 检查是否有会话 ID，恢复之前的中间结果
+        let restoredResults = {};
+        if (processedArgs.session_id) {
+          const sessionData = this.getSession(processedArgs.session_id);
+          if (sessionData) {
+            restoredResults = sessionData.results || {};
+            console.error(`   恢复了 ${Object.keys(restoredResults).length} 个中间结果字段`);
+          }
+        }
+
         // 1. 从 API 获取需要执行的 SQL（传递处理后的 args 参数）
         console.error('   Step 1: Fetching SQL queries from Central API...');
         const queryDef = await this.getQueriesFromAPI(
@@ -3333,7 +3673,8 @@ class ThinMCPServer {
         );
         console.error(`   Got ${queryDef.queries.length} queries to execute`);
 
-        let results = {};
+        // 初始化 results，合并恢复的会话数据
+        let results = { ...restoredResults };
 
         // 检查是否需要两阶段 profile 获取
         const metaQuery = queryDef.queries.find(
@@ -3346,7 +3687,9 @@ class ThinMCPServer {
         // 2. 执行 SQL（如果有的话）
         if (regularQueries.length > 0) {
           console.error('   Step 2: Executing SQL queries locally...');
-          results = await this.executeQueries(regularQueries, requestId);
+          const queryResults = await this.executeQueries(regularQueries, requestId);
+          // 合并查询结果，保留已恢复的会话数据
+          results = { ...results, ...queryResults };
           console.error('   SQL execution completed');
         } else {
           console.error(
@@ -3422,6 +3765,22 @@ class ThinMCPServer {
         }
 
         // 3. 发送给 API 分析（支持多阶段查询）
+        // 阶段名称映射（用于用户友好的进度显示）
+        const phaseNames = {
+          'fetch_fe_logs': '获取 FE 日志',
+          'fetch_cn_logs': '获取 CN 日志',
+          'fetch_logs': '获取日志',
+          'discover_log_paths': '探测日志路径',
+          'query_table_meta': '查询表元数据',
+          'list_table_directories': '列出表目录',
+          'get_garbage_sizes': '获取垃圾数据大小',
+          'desc_storage_volumes': '获取存储卷详情',
+          'analyze_schema': '分析表结构',
+          'analyze_trace': '分析 Trace 日志',
+        };
+
+        console.error(`\n   📍 [阶段 1] 初始分析...`);
+        sendProgress(1, 5, '阶段 1: 初始分析...');
         console.error(
           '   Step 3: Sending results to Central API for analysis...',
         );
@@ -3435,11 +3794,48 @@ class ThinMCPServer {
         // 3.5 处理多阶段查询（如存储放大分析的 schema 检测）
         let phaseCount = 1;
         const maxPhases = 5; // 防止无限循环
+
+        // 处理 step_completed 状态：存储会话并返回给客户端，让其更新 TODO 后再调用下一步
+        if (analysis.status === 'step_completed') {
+          console.error(`\n   ✅ 步骤完成: ${analysis.completed_step?.name || analysis.phase}`);
+
+          // 生成或复用会话 ID
+          const sessionId = processedArgs.session_id || this.generateSessionId(toolName);
+
+          // 存储当前结果和中间数据
+          const sessionData = {
+            results: {
+              ...results,
+              _intermediate: analysis._intermediate,
+            },
+            args: processedArgs,
+            lastCompletedStep: analysis.completed_step?.step || 0,
+          };
+          this.storeSession(sessionId, sessionData);
+
+          // 在 next_action.call_with 中添加 session_id
+          if (analysis.next_action && analysis.next_action.call_with) {
+            analysis.next_action.call_with.session_id = sessionId;
+          }
+
+          const stepReport = this.formatStepCompletedReport(analysis, sessionId);
+          return {
+            content: [{ type: 'text', text: stepReport }],
+            _raw: analysis,
+          };
+        }
+
         while (
           analysis.status === 'needs_more_queries' &&
           phaseCount < maxPhases
         ) {
           phaseCount++;
+
+          // 用户友好的进度显示
+          const phaseName = phaseNames[analysis.phase] || analysis.phase;
+          console.error(`\n   📍 [阶段 ${phaseCount}/${maxPhases}] ${phaseName}...`);
+          sendProgress(phaseCount, maxPhases, `阶段 ${phaseCount}: ${phaseName}...`);
+
           console.error(
             `   Step 3.${phaseCount}: Multi-phase query detected (${analysis.phase})`,
           );
@@ -3514,6 +3910,33 @@ class ThinMCPServer {
             }
           }
 
+          // 检查是否需要调用其他工具（工具间调用）
+          if (analysis.requires_tool_call && analysis.tool_name) {
+            console.error(
+              `   Calling tool: ${analysis.tool_name} with full args:`,
+              JSON.stringify(analysis.tool_args || {}),
+            );
+            console.error(
+              `   DEBUG: context_lines = ${analysis.tool_args?.context_lines}`,
+            );
+            // DEBUG: 写入日志文件
+            fs.appendFileSync('/tmp/mcp-debug.log', `\n[${new Date().toISOString()}] requires_tool_call: ${analysis.tool_name}\n  tool_args: ${JSON.stringify(analysis.tool_args)}\n  context_lines: ${analysis.tool_args?.context_lines}\n`);
+
+            // 递归调用指定的工具
+            const toolResult = await this.handleSolutionCTool(
+              analysis.tool_name,
+              analysis.tool_args || {},
+              requestId,
+            );
+
+            // 把工具结果存储到 results 中
+            const resultKey = analysis.tool_result_key || `${analysis.tool_name}_result`;
+            results[resultKey] = toolResult;
+            console.error(
+              `   Tool ${analysis.tool_name} completed, result stored as: ${resultKey}`,
+            );
+          }
+
           // 执行下一阶段的 SQL 查询
           if (analysis.next_queries && analysis.next_queries.length > 0) {
             console.error(
@@ -3559,6 +3982,41 @@ class ThinMCPServer {
           console.error(
             '   Warning: Max phases reached, analysis may be incomplete',
           );
+        }
+
+        // 检查 while 循环后是否变为 step_completed 状态
+        // 这种情况发生在 needs_more_queries 循环中最后一次调用返回 step_completed 时
+        if (analysis.status === 'step_completed') {
+          console.error(`\n   ✅ 步骤完成 (循环后): ${analysis.completed_step?.name || analysis.phase}`);
+
+          // 存储会话数据
+          const sessionId = processedArgs.session_id || this.generateSessionId(toolName);
+          const sessionData = {
+            results: { ...results, _intermediate: analysis._intermediate },
+            processedArgs,
+            toolName,
+            timestamp: Date.now(),
+          };
+          this.storeSession(sessionId, sessionData);
+
+          // 确保下一步调用参数中包含 session_id
+          if (analysis.next_action && analysis.next_action.call_with) {
+            analysis.next_action.call_with.session_id = sessionId;
+          }
+
+          const stepReport = this.formatStepCompletedReport(analysis, sessionId);
+          return {
+            content: [{ type: 'text', text: stepReport }],
+            _raw: analysis,
+          };
+        }
+
+        // 显示总阶段数
+        if (phaseCount > 1) {
+          console.error(`\n   ✅ 多阶段分析完成 (共 ${phaseCount} 个阶段)`);
+          sendProgress(phaseCount, phaseCount, `✅ 分析完成 (共 ${phaseCount} 个阶段)`);
+        } else {
+          sendProgress(1, 1, '✅ 分析完成');
         }
 
         // 显示分析方式（便于用户确认是否使用了 CLI 扫描）
