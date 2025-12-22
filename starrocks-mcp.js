@@ -1564,6 +1564,7 @@ class ThinMCPServer {
 
       const batchResults = await Promise.all(
         batch.map(async (cmd) => {
+          const cmdStartTime = Date.now();  // 在 try 外定义，确保 catch 可以访问
           try {
             const nodeIp = cmd.node_ip;
             const remoteCmd = cmd.ssh_command;
@@ -1592,7 +1593,6 @@ class ThinMCPServer {
             if (commandType === 'fetch_log_scp') {
               // 使用流式传输避免 maxBuffer 限制
               // SSH 输出直接流式写入本地临时文件，然后读取解压
-              const cmdStartTime = Date.now();
               const tmpDir = os.tmpdir();
               const tmpFile = path.join(
                 tmpDir,
@@ -1731,8 +1731,6 @@ class ThinMCPServer {
             }
 
             // 其他命令类型使用 execAsync
-            const cmdStartTime = Date.now();
-
             const { stdout, stderr } = await execAsync(fullCmd, {
               timeout: commandTimeoutMs,
               maxBuffer: 50 * 1024 * 1024, // 50MB（日志可能较大）
@@ -1810,6 +1808,7 @@ class ThinMCPServer {
                 success: true,
                 output: stdout,
                 execution_time_ms: duration,
+                metadata: cmd.metadata || null,  // 保留原始命令中的 metadata
               };
             }
           } catch (error) {
@@ -2661,6 +2660,56 @@ class ThinMCPServer {
   }
 
   /**
+   * 生成简短摘要（用于返回给 LLM，减少 Token 消耗）
+   * 方案 B：完整报告已写入文件
+   * @param {Object} analysis - 分析结果
+   * @param {string} reportPath - 报告文件路径（可选）
+   */
+  generateBriefSummary(analysis, reportPath = null) {
+    if (!analysis || typeof analysis !== 'object') {
+      return '❌ 分析结果格式错误';
+    }
+
+    const { tool, status, summary, expert } = analysis;
+
+    // 构建简短摘要
+    let briefSummary = '✅ 分析完成\n\n';
+
+    // 根据不同工具生成不同的摘要
+    if (tool === 'analyze_slow_load_job' && summary) {
+      briefSummary += '📊 **关键发现**\n';
+      briefSummary += `- 任务标签: ${summary.label || '未知'}\n`;
+      briefSummary += `- 主要瓶颈: ${summary.primary_bottleneck || '未识别'}\n`;
+      if (summary.total_duration_ms) {
+        const durationSec = (summary.total_duration_ms / 1000).toFixed(1);
+        briefSummary += `- 总耗时: ${durationSec}s\n`;
+      }
+      if (summary.recommendations_count) {
+        briefSummary += `- 优化建议: ${summary.recommendations_count} 条\n`;
+      }
+    } else if (tool === 'analyze_slow_publish_transactions' && summary) {
+      briefSummary += '📊 **关键发现**\n';
+      briefSummary += `- 分析事务数: ${summary.total_transactions || 0}\n`;
+      briefSummary += `- 发现问题数: ${summary.issues_found || 0}\n`;
+    } else if (analysis.diagnosis_results) {
+      briefSummary += '📊 **诊断摘要**\n';
+      briefSummary += `- ${analysis.diagnosis_results.summary || '分析完成'}\n`;
+      briefSummary += `- 发现问题: ${analysis.diagnosis_results.total_issues || 0} 个\n`;
+    } else {
+      briefSummary += `工具: ${tool || expert || '未知'}\n`;
+      briefSummary += `状态: ${status || '未知'}\n`;
+    }
+
+    // 显示报告文件路径
+    if (reportPath) {
+      briefSummary += `\n📄 **完整报告**: \`${reportPath}\`\n`;
+      briefSummary += `\n💡 使用 \`cat ${reportPath}\` 查看完整分析报告`;
+    }
+
+    return briefSummary;
+  }
+
+  /**
    * 格式化分析报告
    */
   formatAnalysisReport(analysis) {
@@ -2881,109 +2930,44 @@ class ThinMCPServer {
   }
 
   /**
-   * 格式化步骤完成报告
+   * 格式化步骤完成报告（精简版 - 方案 B）
+   * 只返回简短进度信息，详细数据存储在服务端会话中
    * @param {Object} analysis - 分析结果
    * @param {string} sessionId - 会话 ID（用于恢复中间状态）
    */
   formatStepCompletedReport(analysis, sessionId = null) {
-    let report = '';
     const step = analysis.completed_step || {};
+    const totalSteps = analysis.total_steps || 6;
+    const currentStep = step.step || '?';
 
-    report += `✅ 步骤 ${step.step || '?'} 完成: ${step.name || analysis.phase || '未知步骤'}\n\n`;
+    // 简短的进度信息
+    let report = `⏳ 进度 ${currentStep}/${totalSteps}: ${step.name || analysis.phase || '未知步骤'}\n\n`;
 
+    // 只显示一行结果摘要
     if (step.result_summary) {
-      report += `📊 执行结果:\n${step.result_summary}\n\n`;
+      // 截取第一行作为简短摘要
+      const firstLine = step.result_summary.split('\n')[0];
+      report += `📊 ${firstLine}\n\n`;
     }
 
-    // 展示详细结果（如果有）
-    if (step.result_details) {
-      report += `📋 详细信息:\n`;
-      if (step.result_details.description) {
-        report += `${step.result_details.description}\n\n`;
-      }
-
-      // 格式化事务详情（步骤2）
-      if (step.result_details.transactions && step.result_details.transactions.length > 0) {
-        report += `┌────────────┬────────────────────────────────┬──────────────┬──────────────┬──────────────┐\n`;
-        report += `│ TXN ID     │ Label                          │ Publish(ms)  │ Wait(ms)     │ RPC(ms)      │\n`;
-        report += `├────────────┼────────────────────────────────┼──────────────┼──────────────┼──────────────┤\n`;
-        for (const txn of step.result_details.transactions.slice(0, 10)) {
-          const txnId = String(txn.txn_id || '').padEnd(10).substring(0, 10);
-          const label = String(txn.label || 'N/A').padEnd(30).substring(0, 30);
-          const publish = String(txn.publish_total_cost_ms || 0).padStart(12);
-          const wait = String(txn.wait_for_publish_cost_ms || 0).padStart(12);
-          const rpc = String(txn.publish_rpc_cost_ms || 0).padStart(12);
-          report += `│ ${txnId} │ ${label} │ ${publish} │ ${wait} │ ${rpc} │\n`;
-        }
-        report += `└────────────┴────────────────────────────────┴──────────────┴──────────────┴──────────────┘\n\n`;
-      }
-
-      // 格式化表元数据（步骤3）
-      if (step.result_details.tables && step.result_details.tables.length > 0) {
-        report += `┌────────────┬────────────────────────────────────────┬──────────────────┬──────────┐\n`;
-        report += `│ Table ID   │ Table Name                             │ Table Model      │ Buckets  │\n`;
-        report += `├────────────┼────────────────────────────────────────┼──────────────────┼──────────┤\n`;
-        for (const table of step.result_details.tables) {
-          const tableId = String(table.table_id || '').padEnd(10).substring(0, 10);
-          const tableName = String(table.table_name || 'N/A').padEnd(38).substring(0, 38);
-          const tableModel = String(table.table_model || 'N/A').padEnd(16).substring(0, 16);
-          const buckets = String(table.buckets || 'N/A').padStart(8);
-          report += `│ ${tableId} │ ${tableName} │ ${tableModel} │ ${buckets} │\n`;
-        }
-        report += `└────────────┴────────────────────────────────────────┴──────────────────┴──────────┘\n\n`;
-      }
-
-      // 格式化 CN 日志详情（步骤4）
-      if (step.result_details.cn_logs && step.result_details.cn_logs.length > 0) {
-        report += `┌────────────┬──────────────┬──────────────┬─────────────────────────────────────────────────┐\n`;
-        report += `│ TXN ID     │ CN Cost(ms)  │ Tablets      │ 日志预览                                        │\n`;
-        report += `├────────────┼──────────────┼──────────────┼─────────────────────────────────────────────────┤\n`;
-        for (const cn of step.result_details.cn_logs) {
-          const txnId = String(cn.txn_id || '').padEnd(10).substring(0, 10);
-          const cnCost = String(cn.cn_cost_ms || 'N/A').padStart(12);
-          const tablets = String(cn.tablets_count || 0).padStart(12);
-          const preview = String(cn.raw_log_preview || '').substring(0, 45).padEnd(47);
-          report += `│ ${txnId} │ ${cnCost} │ ${tablets} │ ${preview} │\n`;
-        }
-        report += `└────────────┴──────────────┴──────────────┴─────────────────────────────────────────────────┘\n\n`;
-      }
-
-      // 格式化 FE vs CN 对比（步骤4）
-      if (step.result_details.fe_vs_cn_comparison && step.result_details.fe_vs_cn_comparison.length > 0) {
-        report += `FE vs CN 耗时对比:\n`;
-        report += `┌────────────┬──────────────────┬──────────────────┬──────────────────┐\n`;
-        report += `│ TXN ID     │ FE RPC(ms)       │ CN 实际(ms)      │ 网络延迟(ms)     │\n`;
-        report += `├────────────┼──────────────────┼──────────────────┼──────────────────┤\n`;
-        for (const cmp of step.result_details.fe_vs_cn_comparison) {
-          const txnId = String(cmp.txn_id || '').padEnd(10).substring(0, 10);
-          const feRpc = String(cmp.fe_publish_rpc_ms || 0).padStart(16);
-          const cnCost = String(cmp.cn_actual_cost_ms || '0.00').padStart(16);
-          const network = String(cmp.estimated_network_latency_ms || '0.00').padStart(16);
-          report += `│ ${txnId} │ ${feRpc} │ ${cnCost} │ ${network} │\n`;
-        }
-        report += `└────────────┴──────────────────┴──────────────────┴──────────────────┘\n\n`;
-      }
-
-      // 展示备注
-      if (step.result_details.note) {
-        report += `💡 ${step.result_details.note}\n\n`;
-      }
-    }
-
+    // 下一步提示
     if (analysis.next_step) {
-      report += `⏭️ 下一步: 步骤 ${analysis.next_step.step} - ${analysis.next_step.name}\n`;
-      report += `   ${analysis.next_step.description || ''}\n\n`;
+      report += `⏭️ 下一步: ${analysis.next_step.name}\n\n`;
     }
 
-    report += `⚠️ 请更新 TODO 列表（将步骤 ${step.step} 标记为完成），然后再次调用本工具继续执行。\n`;
-
+    // 继续调用的参数（简化格式）
     if (analysis.next_action && analysis.next_action.call_with) {
-      // 确保 session_id 在参数中
       const callWith = { ...analysis.next_action.call_with };
       if (sessionId && !callWith.session_id) {
         callWith.session_id = sessionId;
       }
-      report += `\n📝 下次调用参数:\n\`\`\`json\n${JSON.stringify(callWith, null, 2)}\n\`\`\`\n`;
+      // 只显示关键参数
+      const briefParams = {
+        session_id: callWith.session_id,
+        label: callWith.label,
+        continue_from_step: callWith.continue_from_step,
+      };
+      report += `📝 继续调用: \`${analysis.next_action.tool}(${JSON.stringify(briefParams)})\`\n`;
     }
 
     return report;
@@ -3405,6 +3389,45 @@ class ThinMCPServer {
               console.error(`      ✅ Sub-tool completed after Prometheus query`);
             }
 
+            // 检查子工具返回结果是否需要执行 SSH 命令
+            // 这处理嵌套多阶段调用的情况（如 analyze_slow_load_job -> analyze_fe_transaction_log -> fetch_logs）
+            if (toolResult && toolResult.requires_ssh_execution && toolResult.ssh_commands) {
+              console.error(`      📡 Sub-tool requires SSH execution, executing ${toolResult.ssh_commands.length} commands...`);
+
+              const sshResults = await this.executeSshCommands(
+                toolResult.ssh_commands,
+                toolResult.next_args || {},
+                requestId,
+              );
+
+              console.error(`         ✅ SSH execution completed: ${sshResults.ssh_summary.successful} success, ${sshResults.ssh_summary.failed} failed`);
+
+              // 根据 phase 使用不同的结果键名
+              const nextArgs = {
+                ...(toolResult.next_args || {}),
+              };
+
+              // 根据 phase 存储结果
+              if (toolResult.phase === 'fetch_logs' || toolResult.phase === 'call_fetch_logs') {
+                nextArgs.fetch_logs_result = sshResults.ssh_results;
+                nextArgs.fetch_logs_summary = sshResults.ssh_summary;
+              } else if (toolResult.phase === 'discover_log_paths') {
+                nextArgs.discovered_log_paths = sshResults.ssh_results;
+              } else {
+                nextArgs.ssh_results = sshResults.ssh_results;
+                nextArgs.ssh_summary = sshResults.ssh_summary;
+              }
+
+              // 使用 SSH 结果再次调用子工具获取最终结果
+              console.error(`      🔄 Re-calling ${analysis.tool_name} with SSH results...`);
+              toolResult = await this.handleSolutionCTool(
+                analysis.tool_name,
+                nextArgs,
+                requestId,
+              );
+              console.error(`      ✅ Sub-tool completed after SSH execution`);
+            }
+
             // 把工具结果存储到 results 中
             results[resultKey] = toolResult;
 
@@ -3667,7 +3690,6 @@ class ThinMCPServer {
         const report = this.formatAnalysisReport(analysis);
 
         // 对于 HTML 报告，写入文件并移除大内容避免传输阻塞
-        const analysisForJson = { ...analysis };
         if (analysis.html_content && analysis.output_path) {
           try {
             fs.writeFileSync(
@@ -3681,22 +3703,29 @@ class ThinMCPServer {
               `   Failed to write HTML report: ${writeErr.message}`,
             );
           }
-          // 移除大的 HTML 内容，只保留关键信息
-          analysisForJson.html_content = `[HTML Content Removed - ${Math.round(analysis.html_content.length / 1024)}KB]`;
-          console.error(
-            `   Removed large HTML content (${Math.round(analysis.html_content.length / 1024)}KB) from JSON response`,
-          );
         }
+
+        // ========== 方案 B：报告写入文件 + 返回摘要 ==========
+        // 将完整报告写入文件
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+        const reportFileName = `${toolName}_${timestamp}.md`;
+        const reportPath = `/tmp/${reportFileName}`;
+
+        try {
+          fs.writeFileSync(reportPath, report, 'utf-8');
+          console.error(`   📄 完整报告已写入: ${reportPath}`);
+        } catch (writeErr) {
+          console.error(`   ⚠️ 报告写入失败: ${writeErr.message}`);
+        }
+
+        // 生成简短摘要
+        const summary = this.generateBriefSummary(analysis, reportPath);
 
         return {
           content: [
             {
               type: 'text',
-              text: report,
-            },
-            {
-              type: 'text',
-              text: JSON.stringify(analysisForJson, null, 2),
+              text: summary,
             },
           ],
         };
