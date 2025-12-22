@@ -650,12 +650,21 @@ class ThinMCPServer {
       this.logger.logEnvironmentVariables();
     }
 
-    // 本地处理的 tools 列表（不需要中心服务器）
-    this.localTools = {
-      get_query_profile: true,  // get_query_profile 改为本地处理
-      analyze_load_profile: true,  // analyze_load_profile 本地处理（不需要数据库连接）
-      check_disk_io: true,  // check_disk_io 本地处理（查询本地 Prometheus）
-    };
+    // ========== 重构说明 ==========
+    // 所有工具都通过 Central API 编排（Solution C 模式）
+    // MCP Server 只负责执行原子操作：
+    // - 执行 SQL（executeQueries）
+    // - 读取本地文件（handleReadFileLocally）
+    // - SSH 执行命令（executeSshCommands）
+    // - 查询 Prometheus（queryPrometheusRange）
+    //
+    // Central API 通过以下指令编排：
+    // - requires_sql_execution / next_queries → 执行 SQL
+    // - requires_tool_call: read_file → 读取文件
+    // - requires_ssh_execution → SSH 命令
+    // - requires_prometheus_query → Prometheus 查询
+    //
+    // 不再有 localTools 概念，所有工具都走 handleSolutionCTool
   }
 
   /**
@@ -779,777 +788,47 @@ class ThinMCPServer {
     ];
   }
 
-  /**
-   * 本地处理 get_query_profile
-   * 直接执行 SQL 获取 profile，写入本地文件，返回摘要
-   */
-  async handleGetQueryProfileLocally(args, requestId) {
-    const { query_id } = args;
-
-    if (!query_id) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: '❌ 错误: 缺少必需参数 query_id',
-          },
-        ],
-      };
-    }
-
-    let connection;
-    try {
-      console.error(`   [${requestId}] Connecting to database...`);
-      connection = await mysql.createConnection(this.dbConfig);
-
-      // 禁用当前 session 的 profile 记录
-      await connection.query("SET enable_profile = false");
-
-      // 执行 SQL 获取 profile
-      console.error(`   [${requestId}] Fetching profile for query_id: ${query_id}`);
-      const [rows] = await connection.query(
-        `SELECT get_query_profile('${query_id}') as profile`
-      );
-
-      if (!rows || rows.length === 0 || !rows[0].profile) {
-        // Profile 不存在，检查 enable_profile 配置
-        const [variables] = await connection.query("SHOW VARIABLES LIKE 'enable_profile'");
-        const profileEnabled = variables?.[0]?.Value === 'true' || variables?.[0]?.Value === '1';
-
-        let errorMsg = `❌ 无法获取 Query ID ${query_id} 的 Profile\n\n可能原因:\n`;
-        if (!profileEnabled) {
-          errorMsg += '1. ⚠️ Query Profile 当前未开启（建议: SET GLOBAL enable_profile = true）\n';
-        }
-        errorMsg += '2. Query ID 不存在或格式不正确\n';
-        errorMsg += '3. FE 已重启，Profile 数据丢失（Profile 仅存储在内存中）\n';
-        errorMsg += '4. Profile 已过期（内存保留时间有限）\n';
-        errorMsg += '5. Query 尚未执行完成';
-
-        return {
-          content: [{ type: 'text', text: errorMsg }],
-        };
-      }
-
-      const profile = rows[0].profile;
-
-      // 提取摘要信息
-      const summary = this.extractProfileSummary(profile);
-
-      // 写入本地文件
-      const profileDir = '/tmp/starrocks_profiles';
-      if (!fs.existsSync(profileDir)) {
-        fs.mkdirSync(profileDir, { recursive: true });
-      }
-      const filePath = path.join(profileDir, `profile_${query_id}.txt`);
-      fs.writeFileSync(filePath, profile, 'utf-8');
-      console.error(`   [${requestId}] Profile saved to: ${filePath}`);
-
-      // 构建返回结果
-      const resultText = this.formatProfileSummary(summary, filePath);
-
-      return {
-        content: [{ type: 'text', text: resultText }],
-      };
-
-    } catch (error) {
-      console.error(`   [${requestId}] Error:`, error.message);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `❌ 获取 Profile 失败: ${error.message}`,
-          },
-        ],
-      };
-    } finally {
-      if (connection) {
-        await connection.end();
-      }
-    }
-  }
+  // ========== Solution C 模式说明 ==========
+  // 所有工具都通过 Central API 编排，MCP Server 只负责执行原子操作
+  // - get_query_profile: Central API 返回 requires_sql_execution，MCP Server 执行 SQL
+  // - check_disk_io: Central API 返回 requires_prometheus_query，MCP Server 查询 Prometheus
+  // - read_file: MCP Server 直接读取本地文件（原子操作）
+  // - SSH 命令: Central API 返回 requires_ssh_execution，MCP Server 执行 SSH
 
   /**
-   * 本地处理 analyze_load_profile
-   * 通过中心 API 分析 Load Profile（不需要数据库连接）
+   * 本地处理 read_file 工具
+   * 读取本地文件内容，供 Central API 编排使用
    */
-  async handleAnalyzeLoadProfileLocally(args, requestId) {
-    const { file_path, profile_path, profile_content, profile } = args;
-    const filePath = file_path || profile_path;
-    let profileText = profile_content || profile;
+  async handleReadFileLocally(args, requestId) {
+    const { file_path, path: filePath } = args;
+    const targetPath = file_path || filePath;
 
-    // 如果没有直接提供内容，尝试从文件读取
-    if (!profileText && filePath) {
-      try {
-        console.error(`   [${requestId}] Reading Load Profile from: ${filePath}`);
-        profileText = fs.readFileSync(filePath, 'utf-8');
-        console.error(`   [${requestId}] Profile loaded: ${(profileText.length / 1024).toFixed(2)} KB`);
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `❌ 读取文件失败: ${error.message}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-
-    if (!profileText) {
+    if (!targetPath) {
       return {
-        content: [
-          {
-            type: 'text',
-            text: '❌ 错误: 缺少必需参数 file_path 或 profile_content',
-          },
-        ],
+        content: [{ type: 'text', text: '❌ 错误: 缺少必需参数 file_path' }],
         isError: true,
       };
     }
 
     try {
-      // 调用中心 API 进行分析
-      console.error(`   [${requestId}] Sending to Central API for analysis...`);
-      const analysis = await this.analyzeResultsWithAPI(
-        'analyze_load_profile',
-        {},
-        { profile_content: profileText, file_path: filePath },
-        requestId
-      );
-
-      // 格式化输出
-      const report = this.formatLoadProfileAnalysis(analysis);
+      console.error(`   [${requestId}] Reading file: ${targetPath}`);
+      const content = fs.readFileSync(targetPath, 'utf-8');
+      const fileSizeKB = content.length / 1024;
+      console.error(`   [${requestId}] File loaded: ${fileSizeKB.toFixed(2)} KB`);
 
       return {
-        content: [
-          {
-            type: 'text',
-            text: report,
-          },
-        ],
+        content: [{ type: 'text', text: `文件已读取: ${targetPath} (${fileSizeKB.toFixed(2)} KB)` }],
+        profile_content: content,  // 主要内容
+        file_path: targetPath,
       };
     } catch (error) {
-      console.error(`   [${requestId}] Analysis failed:`, error.message);
+      console.error(`   [${requestId}] Failed to read file: ${error.message}`);
       return {
-        content: [
-          {
-            type: 'text',
-            text: `❌ 分析失败: ${error.message}`,
-          },
-        ],
+        content: [{ type: 'text', text: `❌ 读取文件失败: ${error.message}` }],
         isError: true,
       };
     }
   }
-
-  /**
-   * 格式化 Load Profile 分析结果
-   */
-  formatLoadProfileAnalysis(analysis) {
-    if (analysis.status === 'error') {
-      return `❌ 分析失败: ${analysis.message}`;
-    }
-
-    let report = '';
-    report += '================================================================================\n';
-    report += '                     第一阶段：瓶颈定位与概括分析\n';
-    report += '================================================================================\n\n';
-
-    if (analysis.stage1_bottleneck) {
-      const b = analysis.stage1_bottleneck;
-      report += `【结构化结果】\n`;
-      report += `  瓶颈阶段: ${b.stage}\n`;
-      report += `  置信度:   ${b.confidence}\n`;
-      report += `  存在反压: ${b.is_backpressure ? '是' : '否'}\n`;
-      report += `  触发Spill: ${b.has_spill ? '是' : '否'}\n\n`;
-      report += `【概括性分析】\n${b.summary || '(无)'}\n\n`;
-    }
-
-    report += '================================================================================\n';
-    report += '                     第二阶段：深入分析与优化建议\n';
-    report += '================================================================================\n\n';
-
-    if (analysis.stage2_analysis) {
-      report += analysis.stage2_analysis + '\n\n';
-    }
-
-    if (analysis.profile_summary) {
-      report += '================================================================================\n';
-      report += '                            基础指标\n';
-      report += '================================================================================\n\n';
-      const s = analysis.profile_summary;
-      report += `总耗时: ${s.total_time || 'N/A'}\n`;
-      report += `扫描数据量: ${s.scan_bytes || 'N/A'}\n`;
-      report += `吞吐量: ${s.throughput?.bytesPerSecondFormatted || 'N/A'}\n\n`;
-    }
-
-    if (analysis.tokens) {
-      report += '================================================================================\n';
-      report += '                            Token 统计\n';
-      report += '================================================================================\n\n';
-      report += `第一阶段: ${analysis.tokens.stage1 || 'N/A'}\n`;
-      report += `第二阶段: ${analysis.tokens.stage2 || 'N/A'}\n`;
-      report += `总计: ${analysis.tokens.total || 'N/A'}\n`;
-    }
-
-    return report;
-  }
-
-  /**
-   * 从 Profile 文本中提取摘要信息
-   */
-  extractProfileSummary(profileText) {
-    const summary = {
-      queryId: null,
-      startTime: null,
-      endTime: null,
-      duration: null,
-      queryState: null,
-      queryType: null,
-      defaultDb: null,
-      sqlStatement: null,
-      fragmentCount: 0,
-      peakMemory: null,
-      cpuTime: null,
-      scanTime: null,
-    };
-
-    // 提取 Query ID
-    const queryIdMatch = profileText.match(/Query ID:\s*([^\n]+)/);
-    if (queryIdMatch) summary.queryId = queryIdMatch[1].trim();
-
-    // 提取 Start Time
-    const startTimeMatch = profileText.match(/Start Time:\s*([^\n]+)/);
-    if (startTimeMatch) summary.startTime = startTimeMatch[1].trim();
-
-    // 提取 End Time
-    const endTimeMatch = profileText.match(/End Time:\s*([^\n]+)/);
-    if (endTimeMatch) summary.endTime = endTimeMatch[1].trim();
-
-    // 提取 Total Duration
-    const totalMatch = profileText.match(/Total:\s*([^\n]+)/);
-    if (totalMatch) summary.duration = totalMatch[1].trim();
-
-    // 提取 Query State
-    const stateMatch = profileText.match(/Query State:\s*([^\n]+)/);
-    if (stateMatch) summary.queryState = stateMatch[1].trim();
-
-    // 提取 Query Type
-    const typeMatch = profileText.match(/Query Type:\s*([^\n]+)/);
-    if (typeMatch) summary.queryType = typeMatch[1].trim();
-
-    // 提取 Default Db
-    const dbMatch = profileText.match(/Default Db:\s*([^\n]+)/);
-    if (dbMatch) summary.defaultDb = dbMatch[1].trim();
-
-    // 提取 SQL Statement（限制长度）
-    const sqlMatch = profileText.match(/Sql Statement:\s*([\s\S]*?)(?=\n\s+-\s+(?:Warehouse|Variables|NonDefault))/);
-    if (sqlMatch) {
-      let sql = sqlMatch[1].trim();
-      if (sql.length > 500) {
-        sql = sql.substring(0, 500) + '...';
-      }
-      summary.sqlStatement = sql;
-    }
-
-    // 统计 Fragment 数量
-    const fragmentMatches = profileText.match(/Fragment \d+:/g);
-    if (fragmentMatches) summary.fragmentCount = fragmentMatches.length;
-
-    // 提取 Peak Memory
-    const memMatch = profileText.match(/QueryPeakMemoryUsagePerNode:\s*([^\n]+)/);
-    if (memMatch) summary.peakMemory = memMatch[1].trim();
-
-    // 提取 CPU Time
-    const cpuMatch = profileText.match(/QueryCumulativeCpuTime:\s*([^\n]+)/);
-    if (cpuMatch) summary.cpuTime = cpuMatch[1].trim();
-
-    // 提取 Scan Time
-    const scanMatch = profileText.match(/QueryCumulativeScanTime:\s*([^\n]+)/);
-    if (scanMatch) summary.scanTime = scanMatch[1].trim();
-
-    return summary;
-  }
-
-  /**
-   * 格式化 Profile 摘要输出
-   */
-  formatProfileSummary(summary, filePath) {
-    let result = '📊 **Query Profile 摘要**\n\n';
-
-    result += '### 基本信息\n';
-    result += `- **Query ID**: ${summary.queryId || 'N/A'}\n`;
-    result += `- **状态**: ${summary.queryState || 'N/A'}\n`;
-    result += `- **类型**: ${summary.queryType || 'N/A'}\n`;
-    result += `- **数据库**: ${summary.defaultDb || 'N/A'}\n`;
-    result += `- **开始时间**: ${summary.startTime || 'N/A'}\n`;
-    result += `- **结束时间**: ${summary.endTime || 'N/A'}\n`;
-    result += `- **总耗时**: ${summary.duration || 'N/A'}\n`;
-
-    result += '\n### 资源使用\n';
-    result += `- **Fragment 数量**: ${summary.fragmentCount}\n`;
-    result += `- **峰值内存**: ${summary.peakMemory || 'N/A'}\n`;
-    result += `- **CPU 时间**: ${summary.cpuTime || 'N/A'}\n`;
-    result += `- **扫描时间**: ${summary.scanTime || 'N/A'}\n`;
-
-    if (summary.sqlStatement) {
-      result += '\n### SQL 语句\n';
-      result += '```sql\n' + summary.sqlStatement + '\n```\n';
-    }
-
-    result += '\n### Profile 文件\n';
-    result += `完整 Profile 已保存到: \`${filePath}\`\n\n`;
-    result += '💡 **提示**: 使用 Read 工具读取上述文件可查看完整 Profile 进行详细分析。\n';
-
-    return result;
-  }
-
-  /**
-   * 本地处理 check_disk_io
-   * 查询 Prometheus 获取指定时间范围的磁盘 IO 利用率
-   * 只查询 BE 节点 spill_local_storage_dir 对应的磁盘
-   */
-  async handleCheckDiskIOLocally(args, requestId) {
-    const { start_time, end_time, be_addresses } = args;
-
-    // 验证必需参数
-    if (!start_time || !end_time) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: '❌ 错误: 缺少必需参数 start_time 或 end_time',
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    try {
-      // 解析时间为 Unix 时间戳
-      const startTs = Math.floor(new Date(start_time).getTime() / 1000);
-      const endTs = Math.floor(new Date(end_time).getTime() / 1000);
-
-      if (isNaN(startTs) || isNaN(endTs)) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: '❌ 错误: 时间格式无效，请使用 ISO 8601 格式（如 2025-12-12T07:12:46）',
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      console.error(`   [${requestId}] Checking disk IO for Spill storage...`);
-      console.error(`   Time range: ${start_time} to ${end_time}`);
-      console.error(`   BE addresses: ${be_addresses?.join(', ') || 'all'}`);
-
-      // Step 1: 查询 BE 配置获取 spill_local_storage_dir
-      console.error(`   [${requestId}] Step 1: Querying BE spill_local_storage_dir config...`);
-      const spillConfigs = await this.getSpillStorageConfigs(be_addresses);
-
-      if (spillConfigs.length === 0) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: '⚠️ 未找到 BE 的 spill_local_storage_dir 配置\n\n可能原因:\n1. BE 节点不可用\n2. 没有配置 spill_local_storage_dir',
-            },
-          ],
-        };
-      }
-
-      // Step 2: 通过 SSH 获取 spill 目录对应的磁盘设备
-      console.error(`   [${requestId}] Step 2: Detecting disk devices via SSH...`);
-      const diskDevices = await this.detectSpillDiskDevices(spillConfigs, requestId);
-
-      if (diskDevices.length === 0) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: '⚠️ 无法检测 Spill 存储对应的磁盘设备\n\n可能原因:\n1. SSH 连接失败\n2. spill_local_storage_dir 路径不存在',
-            },
-          ],
-        };
-      }
-
-      console.error(`   [${requestId}] Detected Spill disk devices: ${diskDevices.map(d => `${d.beIp}(${d.hostname}):${d.device}`).join(', ')}`);
-
-      // 将 diskDevices 数组转换为 hostname -> device 映射
-      const diskDeviceMap = {};
-      for (const d of diskDevices) {
-        diskDeviceMap[d.hostname] = d.device;
-        diskDeviceMap[d.beIp] = d.device;
-        const config = spillConfigs.find(c => c.beIp === d.beIp);
-        if (config) {
-          config.diskDevice = d.device;
-          config.hostname = d.hostname;
-        }
-      }
-
-      // Step 3: 自动检测 Prometheus scrape_interval
-      console.error(`   [${requestId}] Step 3: Detecting Prometheus scrape_interval...`);
-      const { step, rateWindow, scrapeInterval } = await this.getPrometheusScrapeInterval(requestId);
-
-      // Step 4: 查询 Prometheus 获取对应磁盘的 IO
-      console.error(`   [${requestId}] Step 4: Querying Prometheus for disk IO...`);
-      const baseUrl = `${this.prometheusConfig.protocol}://${this.prometheusConfig.host}:${this.prometheusConfig.port}`;
-
-      const ioUtilQuery = `rate(node_disk_io_time_seconds_total[${rateWindow}]) * 100`;
-      const expectedDataPoints = Math.floor((endTs - startTs) / scrapeInterval);
-      console.error(`   [${requestId}] Duration: ${endTs - startTs}s, step: ${step}, rateWindow: ${rateWindow}, expected data points: ~${expectedDataPoints}`);
-
-      const params = new URLSearchParams({
-        query: ioUtilQuery,
-        start: startTs.toString(),
-        end: endTs.toString(),
-        step: step,
-      });
-
-      const response = await fetch(`${baseUrl}/api/v1/query_range?${params}`, {
-        method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
-      });
-
-      if (!response.ok) {
-        throw new Error(`Prometheus API error: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      if (data.status !== 'success') {
-        throw new Error(`Prometheus query failed: ${data.error || 'unknown error'}`);
-      }
-
-      const results = data.data?.result || [];
-
-      if (results.length === 0) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `⚠️ 未找到磁盘 IO 数据\n\n可能原因:\n1. Node Exporter 未部署或未配置\n2. 时间范围内没有数据\n3. Prometheus 未收集 node_disk_io_time_seconds_total 指标`,
-            },
-          ],
-        };
-      }
-
-      // Step 5: 分析结果（只保留 Spill 磁盘）
-      const analysis = this.analyzeDiskIOResults(results, be_addresses, diskDeviceMap);
-
-      // 格式化输出
-      const report = this.formatDiskIOReport(analysis, start_time, end_time, spillConfigs);
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: report,
-          },
-        ],
-      };
-
-    } catch (error) {
-      console.error(`   [${requestId}] Error:`, error.message);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `❌ 查询磁盘 IO 失败: ${error.message}`,
-          },
-        ],
-        isError: true,
-      };
-    }
-  }
-
-  /**
-   * 自动检测 Prometheus 的 scrape_interval
-   */
-  async getPrometheusScrapeInterval(requestId) {
-    const baseUrl = `${this.prometheusConfig.protocol}://${this.prometheusConfig.host}:${this.prometheusConfig.port}`;
-
-    try {
-      const response = await fetch(`${baseUrl}/api/v1/targets`, {
-        method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
-      });
-
-      if (!response.ok) {
-        console.error(`   [${requestId}] Failed to get Prometheus targets: ${response.status}`);
-        return { step: '15s', rateWindow: '45s', scrapeInterval: 15 };
-      }
-
-      const data = await response.json();
-      if (data.status !== 'success') {
-        return { step: '15s', rateWindow: '45s', scrapeInterval: 15 };
-      }
-
-      const activeTargets = data.data?.activeTargets || [];
-      let scrapeInterval = null;
-
-      for (const target of activeTargets) {
-        const jobName = target.labels?.job || '';
-        if (jobName.toLowerCase().includes('node') ||
-            target.scrapePool?.toLowerCase().includes('node')) {
-          const intervalStr = target.scrapeInterval || '';
-          scrapeInterval = this.parsePrometheusDuration(intervalStr);
-          if (scrapeInterval > 0) {
-            console.error(`   [${requestId}] Detected node_exporter scrape_interval: ${intervalStr} (${scrapeInterval}s)`);
-            break;
-          }
-        }
-      }
-
-      if (!scrapeInterval || scrapeInterval <= 0) {
-        scrapeInterval = 15;
-        console.error(`   [${requestId}] Using default scrape_interval: 15s`);
-      }
-
-      const step = `${scrapeInterval}s`;
-      const rateWindow = `${scrapeInterval * 3}s`;
-
-      return { step, rateWindow, scrapeInterval };
-
-    } catch (error) {
-      console.error(`   [${requestId}] Error detecting scrape_interval:`, error.message);
-      return { step: '15s', rateWindow: '45s', scrapeInterval: 15 };
-    }
-  }
-
-  /**
-   * 解析 Prometheus 时间间隔字符串（返回秒数）
-   */
-  parsePrometheusDuration(durationStr) {
-    if (!durationStr) return 0;
-    const match = durationStr.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d|w|y)$/);
-    if (!match) return 0;
-    const value = parseFloat(match[1]);
-    const unit = match[2];
-    switch (unit) {
-      case 'ms': return value / 1000;
-      case 's': return value;
-      case 'm': return value * 60;
-      case 'h': return value * 3600;
-      default: return 0;
-    }
-  }
-
-  /**
-   * 查询 BE 的 spill_local_storage_dir 配置
-   */
-  async getSpillStorageConfigs(beAddresses) {
-    const connection = await mysql.createConnection(this.dbConfig);
-    try {
-      let nodesMap = {};
-      try {
-        const [backends] = await connection.query('SHOW BACKENDS');
-        for (const be of backends) {
-          nodesMap[be.BackendId || be.Id] = be.IP || be.Host;
-        }
-      } catch (e) { /* ignore */ }
-
-      if (Object.keys(nodesMap).length === 0) {
-        try {
-          const [computeNodes] = await connection.query('SHOW COMPUTE NODES');
-          for (const cn of computeNodes) {
-            nodesMap[cn.ComputeNodeId || cn.Id] = cn.IP || cn.Host;
-          }
-        } catch (e) { /* ignore */ }
-      }
-
-      const [spillRows] = await connection.query(`
-        SELECT BE_ID, VALUE as spill_path
-        FROM information_schema.be_configs
-        WHERE NAME = 'spill_local_storage_dir'
-      `);
-
-      let configs = [];
-      for (const row of spillRows) {
-        const beIp = nodesMap[row.BE_ID];
-        if (beIp && row.spill_path) {
-          configs.push({
-            beId: row.BE_ID,
-            beIp: beIp,
-            spillPath: row.spill_path,
-          });
-        }
-      }
-
-      if (beAddresses && beAddresses.length > 0) {
-        configs = configs.filter(c => beAddresses.includes(c.beIp));
-      }
-
-      return configs;
-    } finally {
-      await connection.end();
-    }
-  }
-
-  /**
-   * 通过 SSH 检测 spill 目录对应的磁盘设备
-   */
-  async detectSpillDiskDevices(spillConfigs, requestId) {
-    const sshCommands = spillConfigs.map(config => ({
-      node_ip: config.beIp,
-      node_type: 'BE',
-      ssh_command: `echo "$(df "${config.spillPath}" 2>/dev/null | tail -1 | awk '{print $1}')|$(hostname)"`,
-    }));
-
-    const sshResults = await this.executeSshCommands(sshCommands, {}, requestId);
-
-    const devices = [];
-    for (const result of sshResults.ssh_results) {
-      if (result.success && result.output) {
-        const parts = result.output.trim().split('|');
-        const devicePath = parts[0] || '';
-        const hostname = parts[1] || '';
-
-        const match = devicePath.match(/\/dev\/([a-z]+)/);
-        if (match) {
-          devices.push({
-            beIp: result.node_ip,
-            hostname: hostname,
-            devicePath: devicePath,
-            device: match[1],
-            spillPath: spillConfigs.find(c => c.beIp === result.node_ip)?.spillPath,
-          });
-        }
-      }
-    }
-
-    return devices;
-  }
-
-  /**
-   * 分析磁盘 IO 查询结果
-   */
-  analyzeDiskIOResults(results, beAddresses, diskDevices = null) {
-    const analysis = {
-      devices: [],
-      summary: {
-        maxIOUtil: 0,
-        avgIOUtil: 0,
-        highIOCount: 0,
-        totalDataPoints: 0,
-      },
-    };
-
-    for (const result of results) {
-      const metric = result.metric || {};
-      const values = result.values || [];
-      const instance = metric.instance || 'unknown';
-      const device = metric.device || 'unknown';
-
-      if (device.startsWith('loop') || device.startsWith('dm-')) {
-        continue;
-      }
-
-      const instanceHost = instance.split(':')[0];
-
-      if (diskDevices && Object.keys(diskDevices).length > 0) {
-        const spillDeviceNames = Object.values(diskDevices);
-        const spillDevice = diskDevices[instanceHost];
-
-        if (spillDevice) {
-          if (device !== spillDevice) continue;
-        } else {
-          if (!spillDeviceNames.includes(device)) continue;
-        }
-      } else if (beAddresses && beAddresses.length > 0) {
-        if (!beAddresses.includes(instanceHost)) continue;
-      }
-
-      const ioValues = values.map(v => parseFloat(v[1])).filter(v => !isNaN(v));
-      if (ioValues.length === 0) continue;
-
-      const maxIO = Math.max(...ioValues);
-      const avgIO = ioValues.reduce((a, b) => a + b, 0) / ioValues.length;
-      const highIOCount = ioValues.filter(v => v > 80).length;
-
-      analysis.devices.push({
-        instance,
-        device,
-        maxIOUtil: maxIO.toFixed(2),
-        avgIOUtil: avgIO.toFixed(2),
-        highIOCount,
-        dataPoints: ioValues.length,
-      });
-
-      analysis.summary.maxIOUtil = Math.max(analysis.summary.maxIOUtil, maxIO);
-      analysis.summary.totalDataPoints += ioValues.length;
-      analysis.summary.highIOCount += highIOCount;
-    }
-
-    if (analysis.devices.length > 0) {
-      const totalAvg = analysis.devices.reduce((sum, d) => sum + parseFloat(d.avgIOUtil), 0);
-      analysis.summary.avgIOUtil = (totalAvg / analysis.devices.length).toFixed(2);
-    }
-
-    analysis.devices.sort((a, b) => parseFloat(b.maxIOUtil) - parseFloat(a.maxIOUtil));
-    return analysis;
-  }
-
-  /**
-   * 格式化磁盘 IO 报告
-   */
-  formatDiskIOReport(analysis, startTime, endTime, spillConfigs = null) {
-    let report = '';
-    report += '================================================================================\n';
-    report += '                        📈 磁盘 IO 利用率分析报告（Spill 磁盘）\n';
-    report += '================================================================================\n\n';
-
-    report += `📅 时间范围: ${startTime} ~ ${endTime}\n\n`;
-
-    if (spillConfigs && spillConfigs.length > 0) {
-      report += '【Spill 存储配置】\n';
-      for (const config of spillConfigs) {
-        const hostInfo = config.hostname ? ` (${config.hostname})` : '';
-        const deviceInfo = config.diskDevice ? ` → 磁盘: ${config.diskDevice}` : '';
-        report += `   ${config.beIp}${hostInfo}: ${config.spillPath}${deviceInfo}\n`;
-      }
-      report += '\n';
-    }
-
-    report += '【汇总】\n';
-    report += `   最大 IO 利用率: ${analysis.summary.maxIOUtil.toFixed(2)}%\n`;
-    report += `   平均 IO 利用率: ${analysis.summary.avgIOUtil}%\n`;
-    report += `   高负载次数 (>80%): ${analysis.summary.highIOCount}\n`;
-    report += `   监控设备数: ${analysis.devices.length}\n\n`;
-
-    const maxIO = analysis.summary.maxIOUtil;
-    if (maxIO > 90) {
-      report += '🔴 **磁盘 IO 利用率极高，存在严重瓶颈！**\n\n';
-    } else if (maxIO > 70) {
-      report += '🟡 **磁盘 IO 利用率较高，可能存在瓶颈**\n\n';
-    } else {
-      report += '✅ **磁盘 IO 利用率正常，未检测到明显瓶颈**\n\n';
-    }
-
-    if (analysis.devices.length > 0) {
-      report += '【各设备详情】\n';
-      report += '┌──────────────────────────────┬──────────┬──────────┬──────────┬────────────┐\n';
-      report += '│ 实例/设备                     │ 最大(%)  │ 平均(%)  │ 高负载次数│ 数据点数   │\n';
-      report += '├──────────────────────────────┼──────────┼──────────┼──────────┼────────────┤\n';
-
-      for (const d of analysis.devices) {
-        const instDev = `${d.instance.split(':')[0]}/${d.device}`.padEnd(28);
-        const maxVal = d.maxIOUtil.padStart(6);
-        const avgVal = d.avgIOUtil.padStart(6);
-        const highCount = String(d.highIOCount).padStart(6);
-        const dataPoints = String(d.dataPoints).padStart(8);
-        report += `│ ${instDev} │ ${maxVal}   │ ${avgVal}   │ ${highCount}   │ ${dataPoints}   │\n`;
-      }
-
-      report += '└──────────────────────────────┴──────────┴──────────┴──────────┴────────────┘\n';
-    }
-
-    return report;
-  }
-
 
   /**
    * 从中心 API 获取工具列表
@@ -1601,25 +880,52 @@ class ThinMCPServer {
    * 执行完整的工具处理流程：获取查询 -> 执行 SQL -> 分析结果
    */
   async handleSolutionCTool(toolName, args = {}, requestId = null) {
-    console.error(`   [Tool-to-Tool] Calling ${toolName}...`);
-    console.error(`   [Tool-to-Tool] Received args: ${JSON.stringify(args)}`);
-    console.error(`   [Tool-to-Tool] context_lines = ${args.context_lines}`);
-    // DEBUG: 写入日志文件
-    fs.appendFileSync('/tmp/mcp-debug.log', `\n[${new Date().toISOString()}] handleSolutionCTool(${toolName})\n  args: ${JSON.stringify(args)}\n  context_lines: ${args.context_lines}\n`);
+    const reqId = requestId || 'no-id';
+
+    console.error(`\n${'='.repeat(60)}`);
+    console.error(`🔄 [${reqId}] TOOL-TO-TOOL: ${toolName}`);
+    console.error(`${'='.repeat(60)}`);
+    console.error(`   Args summary: ${JSON.stringify({
+      label: args.label,
+      database_name: args.database_name,
+      filter_label: args.filter_label,
+      start_time: args.start_time,
+      end_time: args.end_time,
+      context_lines: args.context_lines,
+    })}`);
 
     try {
       // 1. 从中心 API 获取 SQL 查询定义
+      console.error(`\n   [Step 1] Getting queries from Central API...`);
       const queryDef = await this.getQueriesFromAPI(toolName, args, requestId);
-      console.error(`   [Tool-to-Tool] Got ${queryDef.queries.length} queries`);
+      console.error(`   [Step 1] Got ${queryDef.queries?.length || 0} queries`);
 
       // 2. 执行 SQL 查询
       let results = {};
-      const regularQueries = queryDef.queries.filter(q => q.type !== 'meta');
+      const regularQueries = queryDef.queries?.filter(q => q.type !== 'meta') || [];
       if (regularQueries.length > 0) {
+        console.error(`\n   [Step 2] Executing ${regularQueries.length} SQL queries...`);
         results = await this.executeQueries(regularQueries, requestId);
+
+        // 记录查询结果摘要
+        for (const [key, value] of Object.entries(results)) {
+          const rowCount = Array.isArray(value) ? value.length : (value ? 1 : 0);
+          console.error(`      ${key}: ${rowCount} rows`);
+
+          // 特别记录 profile_id
+          if (Array.isArray(value) && value.length > 0) {
+            const firstRow = value[0];
+            if (firstRow.PROFILE_ID || firstRow.profile_id) {
+              console.error(`      📋 First row profile_id: ${firstRow.PROFILE_ID || firstRow.profile_id}`);
+            }
+          }
+        }
+      } else {
+        console.error(`\n   [Step 2] No SQL queries to execute`);
       }
 
       // 3. 发送给中心 API 分析（支持多阶段）
+      console.error(`\n   [Step 3] Sending to Central API for analysis...`);
       let analysis = await this.analyzeResultsWithAPI(
         toolName,
         results,
@@ -1632,10 +938,11 @@ class ThinMCPServer {
       const maxPhases = 5;
       while (analysis.status === 'needs_more_queries' && phaseCount < maxPhases) {
         phaseCount++;
-        console.error(`   [Tool-to-Tool] Phase ${phaseCount}: ${analysis.phase}`);
+        console.error(`\n   [Phase ${phaseCount}] ${analysis.phase_name || analysis.phase}`);
 
         // 执行 SSH 命令（如果需要）
         if (analysis.requires_ssh_execution && analysis.ssh_commands) {
+          console.error(`      Executing SSH commands...`);
           const sshResults = await this.executeSshCommands(
             analysis.ssh_commands,
             args,
@@ -1654,11 +961,38 @@ class ThinMCPServer {
 
         // 执行额外的 SQL 查询（如果需要）
         if (analysis.next_queries && analysis.next_queries.length > 0) {
+          console.error(`      Executing ${analysis.next_queries.length} additional queries...`);
           const additionalResults = await this.executeQueries(
             analysis.next_queries,
             requestId,
           );
           results = { ...results, ...additionalResults };
+        }
+
+        // 执行 Prometheus 查询（如果需要）
+        if (analysis.requires_prometheus_query && analysis.prometheus_queries) {
+          console.error(`      Executing ${analysis.prometheus_queries.length} Prometheus queries...`);
+          const prometheusResultKey = analysis.prometheus_result_key || 'prometheus_metrics';
+          const prometheusResults = {};
+
+          for (const query of analysis.prometheus_queries) {
+            try {
+              const queryResult = await this.queryPrometheusRange(query);
+              prometheusResults[query.id] = queryResult;
+              console.error(`         ✅ Prometheus '${query.id}' completed`);
+            } catch (err) {
+              console.error(`         ❌ Prometheus '${query.id}' failed: ${err.message}`);
+              prometheusResults[query.id] = { error: err.message, status: 'error' };
+            }
+          }
+
+          // 合并 Prometheus 结果
+          results[prometheusResultKey] = prometheusResults;
+
+          // 更新 next_args
+          if (analysis.next_args) {
+            analysis.next_args[prometheusResultKey] = prometheusResults;
+          }
         }
 
         // 重新分析
@@ -1671,10 +1005,12 @@ class ThinMCPServer {
         );
       }
 
-      console.error(`   [Tool-to-Tool] ${toolName} completed with status: ${analysis.status}`);
+      console.error(`\n✅ [${reqId}] TOOL-TO-TOOL ${toolName} completed: status=${analysis.status}`);
+      console.error(`${'='.repeat(60)}\n`);
       return analysis;
     } catch (error) {
-      console.error(`   [Tool-to-Tool] ${toolName} failed: ${error.message}`);
+      console.error(`\n❌ [${reqId}] TOOL-TO-TOOL ${toolName} failed: ${error.message}`);
+      console.error(`${'='.repeat(60)}\n`);
       return {
         status: 'error',
         error: error.message,
@@ -1688,6 +1024,7 @@ class ThinMCPServer {
    */
   async getQueriesFromAPI(toolName, args = {}, requestId = null) {
     const url = `${this.centralAPI}/api/queries/${toolName}`;
+    const reqId = requestId || 'no-id';
 
     try {
       // 使用 POST 请求，将 args 放在请求体中避免 URL 过长
@@ -1705,8 +1042,19 @@ class ThinMCPServer {
         this.logger.logCentralRequest(requestId, 'POST', url, body);
       }
 
-      console.error(`   Fetching queries from: ${url}`);
-      console.error(`   Args size: ${JSON.stringify(args).length} characters`);
+      // 增强的控制台日志
+      console.error(`\n📤 [${reqId}] GET_QUERIES: ${toolName}`);
+      console.error(`   URL: ${url}`);
+      console.error(`   Args: ${JSON.stringify({
+        label: args.label,
+        database_name: args.database_name,
+        txn_id: args.txn_id,
+        execute: args.execute,
+        current_phase: args.current_phase,
+        _hasLoadJobInfo: !!args.load_job_info,
+        _hasProfileContent: !!args.load_profile_content,
+        _hasProfileAnalysis: !!args.profile_analysis,
+      })}`);
 
       const response = await fetch(url, {
         method: 'POST',
@@ -1715,6 +1063,7 @@ class ThinMCPServer {
       });
 
       if (!response.ok) {
+        const errorText = await response.text();
         const error = new Error(
           `API returned ${response.status}: ${response.statusText}`,
         );
@@ -1728,6 +1077,7 @@ class ThinMCPServer {
             error,
           );
         }
+        console.error(`❌ [${reqId}] GET_QUERIES failed: ${response.status} - ${errorText.substring(0, 200)}`);
         throw error;
       }
 
@@ -1738,8 +1088,14 @@ class ThinMCPServer {
         this.logger.logCentralResponse(requestId, url, response.status, data);
       }
 
+      // 增强的控制台日志 - 响应摘要
+      const queriesCount = data.queries?.length || 0;
+      const queryIds = data.queries?.map(q => q.id).join(', ') || 'none';
+      console.error(`📥 [${reqId}] GET_QUERIES response: ${queriesCount} queries [${queryIds}]`);
+
       return data;
     } catch (error) {
+      console.error(`❌ [${reqId}] GET_QUERIES exception: ${error.message}`);
       throw new Error(
         `Failed to get queries for ${toolName}: ${error.message}`,
       );
@@ -1901,29 +1257,57 @@ class ThinMCPServer {
     // 解析时间范围
     const now = Math.floor(Date.now() / 1000);
     let startTime = now - 3600; // 默认 1 小时
+    let endTime = now;
 
-    const timeRange = queryDef.start || '1h';
-    const rangeMatch = timeRange.match(/^(\d+)([hmd])$/);
-    if (rangeMatch) {
-      const value = parseInt(rangeMatch[1]);
-      const unit = rangeMatch[2];
-      switch (unit) {
-        case 'h':
-          startTime = now - value * 3600;
-          break;
-        case 'm':
-          startTime = now - value * 60;
-          break;
-        case 'd':
-          startTime = now - value * 86400;
-          break;
+    // 解析 start 参数
+    if (queryDef.start) {
+      const startStr = queryDef.start;
+      // 方式1: ISO 格式绝对时间 (如 "2024-12-20T07:41:00.000Z")
+      if (startStr.includes('T') || startStr.includes('-')) {
+        const parsed = new Date(startStr);
+        if (!isNaN(parsed.getTime())) {
+          startTime = Math.floor(parsed.getTime() / 1000);
+        }
+      }
+      // 方式2: 相对时间格式 (如 "1h", "30m", "1d")
+      else {
+        const rangeMatch = startStr.match(/^(\d+)([hmd])$/);
+        if (rangeMatch) {
+          const value = parseInt(rangeMatch[1]);
+          const unit = rangeMatch[2];
+          switch (unit) {
+            case 'h':
+              startTime = now - value * 3600;
+              break;
+            case 'm':
+              startTime = now - value * 60;
+              break;
+            case 'd':
+              startTime = now - value * 86400;
+              break;
+          }
+        }
       }
     }
+
+    // 解析 end 参数
+    if (queryDef.end) {
+      const endStr = queryDef.end;
+      // ISO 格式绝对时间
+      if (endStr.includes('T') || endStr.includes('-')) {
+        const parsed = new Date(endStr);
+        if (!isNaN(parsed.getTime())) {
+          endTime = Math.floor(parsed.getTime() / 1000);
+        }
+      }
+    }
+
+    console.error(`   Prometheus range query: start=${new Date(startTime * 1000).toISOString()}, end=${new Date(endTime * 1000).toISOString()}`);
 
     const params = new URLSearchParams({
       query: queryDef.query,
       start: startTime.toString(),
-      end: now.toString(),
+      end: endTime.toString(),
       step: queryDef.step || '1m',
     });
 
@@ -3154,6 +2538,7 @@ class ThinMCPServer {
    */
   async analyzeResultsWithAPI(toolName, results, args = {}, requestId = null) {
     const url = `${this.centralAPI}/api/analyze/${toolName}`;
+    const reqId = requestId || 'no-id';
 
     try {
       const headers = {
@@ -3194,6 +2579,30 @@ class ThinMCPServer {
         this.logger.logCentralRequest(requestId, 'POST', url, body);
       }
 
+      // 增强的控制台日志 - 请求
+      console.error(`\n📤 [${reqId}] ANALYZE: ${toolName}`);
+      console.error(`   URL: ${url}`);
+      console.error(`   Args: ${JSON.stringify({
+        label: args.label,
+        database_name: args.database_name,
+        execute: args.execute,
+        current_phase: args.current_phase,
+        selected_job_index: args.selected_job_index,
+        _hasLoadJobInfo: !!args.load_job_info,
+        _hasProfileContent: !!args.load_profile_content,
+        _hasProfileAnalysis: !!args.profile_analysis,
+        _hasFeTxnAnalysis: !!args.fe_transaction_analysis,
+        _hasDiskIOMetrics: !!args.disk_io_metrics,
+      })}`);
+      console.error(`   Results keys: [${Object.keys(results).join(', ')}]`);
+
+      // 特别记录 load_job_info 中的 profile_id
+      if (args.load_job_info) {
+        const jobs = args.load_job_info.jobs || args.load_job_info.jobs_list || [];
+        const profileIds = jobs.map(j => j.profile_id || j.PROFILE_ID || 'null').join(', ');
+        console.error(`   📋 load_job_info: ${jobs.length} jobs, profile_ids: [${profileIds}]`);
+      }
+
       const response = await fetch(url, {
         method: 'POST',
         headers: headers,
@@ -3201,6 +2610,7 @@ class ThinMCPServer {
       });
 
       if (!response.ok) {
+        const errorText = await response.text();
         const error = new Error(
           `API returned ${response.status}: ${response.statusText}`,
         );
@@ -3214,6 +2624,7 @@ class ThinMCPServer {
             error,
           );
         }
+        console.error(`❌ [${reqId}] ANALYZE failed: ${response.status} - ${errorText.substring(0, 500)}`);
         throw error;
       }
 
@@ -3224,8 +2635,27 @@ class ThinMCPServer {
         this.logger.logCentralResponse(requestId, url, response.status, data);
       }
 
+      // 增强的控制台日志 - 响应摘要
+      console.error(`📥 [${reqId}] ANALYZE response:`);
+      console.error(`   status: ${data.status}`);
+      console.error(`   phase: ${data.phase || '-'}, phase_name: ${data.phase_name || '-'}`);
+      if (data.requires_tool_call) {
+        console.error(`   🔧 requires_tool_call: ${data.tool_name} -> ${data.tool_result_key}`);
+        console.error(`      tool_args: ${JSON.stringify(data.tool_args || {}).substring(0, 200)}`);
+      }
+      if (data.requires_sql_execution) {
+        console.error(`   🔧 requires_sql: ${data.sql?.substring(0, 100)}...`);
+      }
+      if (data.message) {
+        console.error(`   message: ${data.message.substring(0, 150)}`);
+      }
+      if (data.error) {
+        console.error(`   ⚠️ error: ${data.error}`);
+      }
+
       return data;
     } catch (error) {
+      console.error(`❌ [${reqId}] ANALYZE exception: ${error.message}`);
       throw new Error(`Failed to analyze results: ${error.message}`);
     }
   }
@@ -3579,12 +3009,15 @@ class ThinMCPServer {
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       // 获取远程 tools
       const remoteTools = await this.getToolsFromAPI();
-      // 获取本地 tools
+      // 获取本地 tools（仅用于工具定义，实际执行走 Central API）
       const localTools = this.getLocalToolDefinitions();
 
-      // 过滤掉远程 tools 中已在本地处理的 tools
+      // 创建本地工具名称集合，用于过滤
+      const localToolNames = new Set(localTools.map(t => t.name));
+
+      // 过滤掉远程 tools 中与本地 tools 重名的（本地定义优先）
       const filteredRemoteTools = remoteTools.filter(
-        (tool) => !this.localTools[tool.name]
+        (tool) => !localToolNames.has(tool.name)
       );
 
       // 合并：本地 tools 优先
@@ -3623,32 +3056,8 @@ class ThinMCPServer {
         console.error(`\n🔧 [${requestId}] Executing tool: ${toolName}`);
         console.error(`   Arguments:`, JSON.stringify(args).substring(0, 200));
 
-        // 检查是否是本地处理的 tool
-        if (this.localTools[toolName]) {
-          console.error(`   [Local] Processing ${toolName} locally...`);
-
-          let result;
-          switch (toolName) {
-            case 'get_query_profile':
-              result = await this.handleGetQueryProfileLocally(args, requestId);
-              break;
-            case 'analyze_load_profile':
-              result = await this.handleAnalyzeLoadProfileLocally(args, requestId);
-              break;
-            case 'check_disk_io':
-              result = await this.handleCheckDiskIOLocally(args, requestId);
-              break;
-            default:
-              result = {
-                content: [{ type: 'text', text: `Unknown local tool: ${toolName}` }],
-              };
-          }
-
-          console.error(`   [Local] Done processing ${toolName}`);
-          return result;
-        }
-
-        // 以下是远程处理流程（通过中心服务器）
+        // ========== 所有工具都走 Solution C 模式 ==========
+        // Central API 负责编排，MCP Server 只执行原子操作
         // 0. 处理文件路径参数（如果有的话）
         console.error('   Step 0: Processing file arguments...');
         const processedArgs = await this.processFileArgs(args);
@@ -3793,7 +3202,7 @@ class ThinMCPServer {
 
         // 3.5 处理多阶段查询（如存储放大分析的 schema 检测）
         let phaseCount = 1;
-        const maxPhases = 5; // 防止无限循环
+        const maxPhases = 10; // 防止无限循环（需要支持 6+ 阶段的 analyze_slow_load_job）
 
         // 处理 step_completed 状态：存储会话并返回给客户端，让其更新 TODO 后再调用下一步
         if (analysis.status === 'step_completed') {
@@ -3821,6 +3230,18 @@ class ThinMCPServer {
           const stepReport = this.formatStepCompletedReport(analysis, sessionId);
           return {
             content: [{ type: 'text', text: stepReport }],
+            _raw: analysis,
+          };
+        }
+
+        // 处理 needs_selection 状态：返回任务列表让用户选择
+        if (analysis.status === 'needs_selection') {
+          console.error(`\n   🔍 需要用户选择: 找到 ${analysis.jobs_count || 'N/A'} 个匹配任务`);
+
+          // 直接返回报告，让用户看到任务列表并选择
+          const report = analysis.report || analysis.message || '请选择要分析的任务';
+          return {
+            content: [{ type: 'text', text: report }],
             _raw: analysis,
           };
         }
@@ -3912,28 +3333,184 @@ class ThinMCPServer {
 
           // 检查是否需要调用其他工具（工具间调用）
           if (analysis.requires_tool_call && analysis.tool_name) {
-            console.error(
-              `   Calling tool: ${analysis.tool_name} with full args:`,
-              JSON.stringify(analysis.tool_args || {}),
-            );
-            console.error(
-              `   DEBUG: context_lines = ${analysis.tool_args?.context_lines}`,
-            );
-            // DEBUG: 写入日志文件
-            fs.appendFileSync('/tmp/mcp-debug.log', `\n[${new Date().toISOString()}] requires_tool_call: ${analysis.tool_name}\n  tool_args: ${JSON.stringify(analysis.tool_args)}\n  context_lines: ${analysis.tool_args?.context_lines}\n`);
+            const toolArgs = analysis.tool_args || {};
+            const resultKey = analysis.tool_result_key || `${analysis.tool_name}_result`;
 
-            // 递归调用指定的工具
-            const toolResult = await this.handleSolutionCTool(
-              analysis.tool_name,
-              analysis.tool_args || {},
+            // 增强的日志
+            console.error(`\n   🔧 [${requestId}] REQUIRES_TOOL_CALL`);
+            console.error(`      tool_name: ${analysis.tool_name}`);
+            console.error(`      tool_result_key: ${resultKey}`);
+            console.error(`      tool_args: ${JSON.stringify({
+              label: toolArgs.label,
+              database_name: toolArgs.database_name,
+              filter_label: toolArgs.filter_label,
+              profile_id: toolArgs.profile_id,
+              query_id: toolArgs.query_id,
+              start_time: toolArgs.start_time,
+              end_time: toolArgs.end_time,
+              include_recommendations: toolArgs.include_recommendations,
+              _hasProfileContent: !!toolArgs.profile_content,
+            })}`);
+
+            let toolResult;
+
+            // ========== 原子操作 vs 工具调用 ==========
+            // 原子操作：MCP Server 直接执行（不需要 Central API）
+            // 工具调用：递归调用 handleSolutionCTool（由 Central API 编排）
+
+            if (analysis.tool_name === 'read_file') {
+              // read_file 是原子操作：读取本地文件
+              console.error(`      📂 Primitive: reading local file...`);
+              toolResult = await this.handleReadFileLocally(toolArgs, requestId);
+            } else {
+              // 其他都是工具调用，通过 Central API 编排
+              console.error(`      🌐 Tool call: ${analysis.tool_name} via Central API...`);
+              toolResult = await this.handleSolutionCTool(
+                analysis.tool_name,
+                analysis.tool_args || {},
+                requestId,
+              );
+            }
+
+            // 检查子工具返回结果是否需要执行 Prometheus 查询
+            // 这处理嵌套多阶段调用的情况（如 analyze_slow_load_job -> check_disk_io -> Prometheus）
+            if (toolResult && toolResult.requires_prometheus_query && toolResult.prometheus_queries) {
+              console.error(`      📊 Sub-tool requires Prometheus query, executing...`);
+              const prometheusResults = {};
+
+              for (const query of toolResult.prometheus_queries) {
+                try {
+                  const queryResult = await this.queryPrometheusRange(query);
+                  prometheusResults[query.id] = queryResult;
+                  console.error(`         ✅ Prometheus query '${query.id}' completed`);
+                } catch (err) {
+                  console.error(`         ❌ Prometheus query '${query.id}' failed: ${err.message}`);
+                  prometheusResults[query.id] = { error: err.message, status: 'error' };
+                }
+              }
+
+              // 使用 Prometheus 结果再次调用子工具获取最终结果
+              const prometheusResultKey = toolResult.prometheus_result_key || 'prometheus_metrics';
+              const nextArgs = {
+                ...(toolResult.next_args || {}),
+                [prometheusResultKey]: prometheusResults,
+              };
+
+              console.error(`      🔄 Re-calling ${analysis.tool_name} with Prometheus results...`);
+              toolResult = await this.handleSolutionCTool(
+                analysis.tool_name,
+                nextArgs,
+                requestId,
+              );
+              console.error(`      ✅ Sub-tool completed after Prometheus query`);
+            }
+
+            // 把工具结果存储到 results 中
+            results[resultKey] = toolResult;
+
+            // 同时更新 next_args，因为 Central API 从 args 中读取结果
+            if (analysis.next_args) {
+              analysis.next_args[resultKey] = toolResult;
+            }
+
+            // 增强的结果日志
+            console.error(`      ✅ Tool ${analysis.tool_name} completed`);
+            console.error(`         result stored as: ${resultKey}`);
+            if (toolResult) {
+              console.error(`         result.status: ${toolResult.status || '-'}`);
+              console.error(`         result keys: [${Object.keys(toolResult).join(', ')}]`);
+              // 特别记录 profile_analysis 相关字段
+              if (resultKey === 'profile_analysis') {
+                console.error(`         has bottleneck_metrics: ${!!toolResult.bottleneck_metrics}`);
+                console.error(`         has stage1_bottleneck: ${!!toolResult.stage1_bottleneck}`);
+                if (toolResult.bottleneck_metrics) {
+                  console.error(`         bottleneck_metrics keys: [${Object.keys(toolResult.bottleneck_metrics).join(', ')}]`);
+                }
+              }
+              if (toolResult.jobs || toolResult.jobs_list) {
+                const jobs = toolResult.jobs || toolResult.jobs_list || [];
+                const profileIds = jobs.map(j => j.profile_id || j.PROFILE_ID || 'null').join(', ');
+                console.error(`         📋 jobs count: ${jobs.length}, profile_ids: [${profileIds}]`);
+              }
+              if (toolResult.error) {
+                console.error(`         ⚠️ error: ${toolResult.error}`);
+              }
+            }
+          }
+
+          // 检查是否需要执行单个 SQL（如 SELECT get_query_profile）
+          // 注意：requires_sql_execution 用于单个 SQL，next_queries 用于多个查询
+          if (analysis.requires_sql_execution && analysis.sql) {
+            console.error(`\n   🔧 [${requestId}] REQUIRES_SQL_EXECUTION`);
+            console.error(`      sql: ${analysis.sql.substring(0, 120)}...`);
+            console.error(`      sql_result_key: ${analysis.sql_result_key || 'sql_result'}`);
+
+            const sqlResultKey = analysis.sql_result_key || 'sql_result';
+            const sqlResults = await this.executeQueries(
+              [
+                {
+                  id: sqlResultKey,
+                  sql: analysis.sql,
+                  description: analysis.message || 'Executing SQL',
+                },
+              ],
               requestId,
             );
 
-            // 把工具结果存储到 results 中
-            const resultKey = analysis.tool_result_key || `${analysis.tool_name}_result`;
-            results[resultKey] = toolResult;
+            // 合并结果到 results
+            results = { ...results, ...sqlResults };
+
+            // 同时更新 next_args，因为 Central API 从 args 中读取结果
+            if (analysis.next_args) {
+              analysis.next_args[sqlResultKey] = sqlResults[sqlResultKey];
+            }
+
+            // 增强的结果日志
+            const sqlResult = sqlResults[sqlResultKey];
+            const resultRowCount = Array.isArray(sqlResult) ? sqlResult.length : (sqlResult ? 1 : 0);
+            const resultSize = JSON.stringify(sqlResult || '').length;
+            console.error(`      ✅ SQL executed, result stored as: ${sqlResultKey}`);
+            console.error(`         rows: ${resultRowCount}, size: ${(resultSize / 1024).toFixed(2)} KB`);
+          }
+
+          // 检查是否需要执行 Prometheus 查询
+          if (analysis.requires_prometheus_query && analysis.prometheus_queries) {
             console.error(
-              `   Tool ${analysis.tool_name} completed, result stored as: ${resultKey}`,
+              `   Executing ${analysis.prometheus_queries.length} Prometheus range queries...`,
+            );
+
+            const prometheusResultKey =
+              analysis.prometheus_result_key || 'prometheus_metrics';
+            const prometheusResults = {};
+
+            for (const query of analysis.prometheus_queries) {
+              try {
+                const queryResult = await this.queryPrometheusRange(query);
+                prometheusResults[query.id] = queryResult;
+                console.error(
+                  `   Prometheus query '${query.id}' completed`,
+                );
+              } catch (err) {
+                console.error(
+                  `   Prometheus query '${query.id}' failed: ${err.message}`,
+                );
+                prometheusResults[query.id] = {
+                  error: err.message,
+                  status: 'error',
+                };
+              }
+            }
+
+            // 合并结果到 results
+            results[prometheusResultKey] = prometheusResults;
+
+            // 同时更新 next_args，因为 Central API 从 args 中读取结果
+            if (analysis.next_args) {
+              analysis.next_args[prometheusResultKey] = prometheusResults;
+            }
+
+            console.error(
+              `   Prometheus queries executed, result stored as: ${prometheusResultKey}`,
             );
           }
 
@@ -3982,6 +3559,52 @@ class ThinMCPServer {
           console.error(
             '   Warning: Max phases reached, analysis may be incomplete',
           );
+        }
+
+        // ========== 处理 suggested_actions：自动执行建议的后续操作 ==========
+        // suggested_actions 可能在两个位置：
+        // 1. analysis.suggested_actions（直接在分析结果中）
+        // 2. analysis.load_profile_analysis?.suggested_actions（嵌套在 load_profile_analysis 中）
+        const suggestedActions = analysis.suggested_actions ||
+                                 analysis.load_profile_analysis?.suggested_actions ||
+                                 [];
+
+        if (suggestedActions.length > 0) {
+          console.error(`\n   🔧 [${requestId}] AUTO-EXECUTING suggested_actions (${suggestedActions.length} actions)`);
+
+          for (const action of suggestedActions) {
+            console.error(`      📍 ${action.tool}: ${action.reason}`);
+
+            let actionResult;
+
+            try {
+              // 所有工具都通过 Central API 编排
+              if (action.tool === 'read_file') {
+                // read_file 是原子操作：读取本地文件
+                console.error(`         📂 Primitive: reading local file...`);
+                actionResult = await this.handleReadFileLocally(action.params || {}, requestId);
+              } else {
+                // 其他都是工具调用，通过 Central API 编排
+                console.error(`         🌐 Tool call via Central API...`);
+                actionResult = await this.handleSolutionCTool(action.tool, action.params || {}, requestId);
+              }
+
+              // 将结果存储到 analysis 中
+              const resultKey = `${action.tool}_result`;
+              analysis[resultKey] = actionResult;
+              console.error(`         ✅ ${action.tool} completed, result stored as: ${resultKey}`);
+
+              // 如果结果中包含报告文本，提取出来
+              if (actionResult?.content?.[0]?.text) {
+                analysis[`${action.tool}_report`] = actionResult.content[0].text;
+              }
+            } catch (err) {
+              console.error(`         ❌ ${action.tool} failed: ${err.message}`);
+              analysis[`${action.tool}_error`] = err.message;
+            }
+          }
+
+          console.error(`   ✅ All suggested_actions executed\n`);
         }
 
         // 检查 while 循环后是否变为 step_completed 状态
