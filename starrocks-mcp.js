@@ -876,6 +876,136 @@ class ThinMCPServer {
   }
 
   /**
+   * 生成发现 FE 日志路径的 SSH 命令
+   * 注意：使用 -Djava.security.policy= 参数提取 FE 安装目录，因为 -Xlog:gc*: 指向的 GC 日志路径
+   * 可能与实际 fe.log 目录不同（用户可能配置了不同的 GC 日志输出目录）
+   */
+  getDiscoverFeLogPathCommand(queryPort = null) {
+    if (queryPort) {
+      return `lsof -i :${queryPort} -s TCP:LISTEN -t 2>/dev/null | head -1 | xargs -I{} ps -p {} -o args= 2>/dev/null | sed -n 's/.*-Djava.security.policy=\\([^[:space:]]*\\).*/\\1/p' | sed 's|/conf/udf_security.policy|/log|'`;
+    }
+    return `ps aux | grep 'StarRocksFE' | grep -v grep | head -1 | sed -n 's/.*-Djava.security.policy=\\([^[:space:]]*\\).*/\\1/p' | sed 's|/conf/udf_security.policy|/log|'`;
+  }
+
+  /**
+   * 生成发现 BE 日志路径的 SSH 命令
+   */
+  getDiscoverBeLogPathCommand() {
+    return `ps -eo cmd | grep 'starrocks_be' | grep -v ' --cn' | grep -v grep | grep -oE '/[^ ]*starrocks_be' | head -1 | sed 's|/lib/starrocks_be$|/log|; s|/bin/starrocks_be$|/log|'`;
+  }
+
+  /**
+   * 生成发现 CN 日志路径的 SSH 命令
+   */
+  getDiscoverCnLogPathCommand(bePort = null) {
+    if (bePort) {
+      return `lsof -i :${bePort} -s TCP:LISTEN -t 2>/dev/null | head -1 | xargs -I{} ps -p {} -o args= 2>/dev/null | grep -oE '/[^ ]*starrocks_be' | sed 's|/lib/starrocks_be$|/log|; s|/bin/starrocks_be$|/log|'`;
+    }
+    return `ps -eo cmd | grep 'starrocks_be.*--cn' | grep -v grep | grep -oE '/[^ ]*starrocks_be' | head -1 | sed 's|/lib/starrocks_be$|/log|; s|/bin/starrocks_be$|/log|'`;
+  }
+
+  /**
+   * 本地处理 fetch_logs 工具（避免嵌套调用）
+   */
+  async handleFetchLogsLocally(args, requestId = null) {
+    const { nodes = [], keyword = '', last_hours = 2, log_level = 'INFO', context_lines = 0 } = args;
+
+    console.error(`      📋 Local fetch_logs: ${nodes.length} nodes, keyword="${keyword}"`);
+
+    // 阶段1：发现日志路径
+    console.error(`         Step 1: Discovering log paths...`);
+    const discoverCommands = nodes.map(node => {
+      let cmd;
+      if (node.type === 'fe' || node.node_type === 'fe') {
+        cmd = this.getDiscoverFeLogPathCommand(node.query_port || node.queryPort);
+      } else if (node.type === 'cn' || node.node_type === 'cn') {
+        cmd = this.getDiscoverCnLogPathCommand(node.be_port || node.bePort);
+      } else {
+        cmd = this.getDiscoverBeLogPathCommand();
+      }
+
+      return {
+        node_ip: node.ip || node.node_ip,
+        node_type: node.type || node.node_type,
+        ssh_command: cmd,
+        command_type: 'discover_log_path',
+      };
+    });
+
+    const pathResults = await this.executeSshCommands(discoverCommands, {}, requestId);
+    console.error(`         ✅ Discovered ${pathResults.ssh_summary.successful} paths`);
+
+    // 阶段2：拉取日志
+    console.error(`         Step 2: Fetching logs...`);
+    const fetchCommands = [];
+
+    for (const result of pathResults.ssh_results) {
+      if (!result.success || !result.output) continue;
+
+      const logDir = result.output.trim();
+      const nodeType = result.node_type;
+      const logFile = nodeType === 'fe' ? 'fe.log*' : nodeType === 'cn' ? 'cn.log*' : 'be.log*';
+
+      // 构建日志拉取命令
+      // 使用更大的 mtime 范围以确保能找到所有轮转的日志文件
+      // 实际的时间过滤由日志内容的时间戳来完成
+      const mtimeDays = Math.max(Math.ceil(last_hours / 24), 7);  // 至少搜索 7 天
+
+      // 先列出找到的文件（用于调试）
+      const findCmd = `find ${logDir} -name "${logFile}" -mtime -${mtimeDays}`;
+      let fetchCmd = findCmd;
+
+      console.error(`         📂 Find command: ${findCmd}`);
+      console.error(`         📂 mtime days: ${mtimeDays}, last_hours: ${last_hours}`);
+
+      if (keyword) {
+        fetchCmd += ` | xargs grep -ah "${keyword}"`;  // -h 去掉文件名前缀, -a 强制处理二进制文件
+        if (context_lines > 0) {
+          fetchCmd += ` -A ${context_lines} -B ${context_lines}`;
+        }
+      } else {
+        fetchCmd += ` | xargs cat`;
+      }
+
+      console.error(`         🔍 Full fetch command: ${fetchCmd}`);
+      fetchCommands.push({
+        node_ip: result.node_ip,
+        node_type: result.node_type,
+        ssh_command: fetchCmd,
+        command_type: 'fetch_log_content',
+      });
+    }
+
+    const logResults = await this.executeSshCommands(fetchCommands, {}, requestId);
+    console.error(`         ✅ Fetched logs from ${logResults.ssh_summary.successful} nodes`);
+
+    // 构建返回结果
+    const logSources = logResults.ssh_results.map(result => ({
+      node_ip: result.node_ip,
+      node_type: result.node_type,
+      status: result.success ? 'success' : 'failed',
+      lines: result.output ? result.output.split('\n').length : 0,
+    }));
+
+    const allRawContents = logResults.ssh_results
+      .filter(r => r.success && r.output)
+      .map(r => r.output);
+    const rawContent = allRawContents.join('\n');
+
+    return {
+      status: 'completed',
+      tool: 'fetch_logs',
+      nodes_analyzed: nodes.length,
+      log_sources: logSources,
+      log_analysis: {
+        raw_content: rawContent,
+        total_lines: rawContent.split('\n').length,
+      },
+      summary: `成功从 ${logResults.ssh_summary.successful} 个节点获取日志，共 ${rawContent.split('\n').length} 行`,
+    };
+  }
+
+  /**
    * 递归调用 Solution C 工具（用于工具间调用）
    * 执行完整的工具处理流程：获取查询 -> 执行 SQL -> 分析结果
    */
@@ -992,6 +1122,20 @@ class ThinMCPServer {
           // 更新 next_args
           if (analysis.next_args) {
             analysis.next_args[prometheusResultKey] = prometheusResults;
+          }
+        }
+
+        // 执行工具调用（如果需要）- 用于嵌套工具调用
+        if (analysis.requires_tool_call && analysis.tool_name) {
+          console.error(`      📋 Tool call: ${analysis.tool_name}`);
+          const toolResultKey = analysis.tool_result_key || 'tool_result';
+
+          if (analysis.tool_name === 'fetch_logs') {
+            const toolResult = await this.handleFetchLogsLocally(analysis.tool_args, requestId);
+            results[toolResultKey] = toolResult;
+            console.error(`         ✅ Tool '${analysis.tool_name}' completed`);
+          } else {
+            console.error(`         ❌ Unknown tool: ${analysis.tool_name}`);
           }
         }
 
@@ -3346,6 +3490,10 @@ class ThinMCPServer {
               // read_file 是原子操作：读取本地文件
               console.error(`      📂 Primitive: reading local file...`);
               toolResult = await this.handleReadFileLocally(toolArgs, requestId);
+            } else if (analysis.tool_name === 'fetch_logs') {
+              // fetch_logs 是本地工具：MCP Server 自主处理日志获取
+              console.error(`      📋 Primitive: fetching logs locally...`);
+              toolResult = await this.handleFetchLogsLocally(toolArgs, requestId);
             } else {
               // 其他都是工具调用，通过 Central API 编排
               console.error(`      🌐 Tool call: ${analysis.tool_name} via Central API...`);
