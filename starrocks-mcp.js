@@ -1164,6 +1164,55 @@ class ThinMCPServer {
   }
 
   /**
+   * 从中心 API 获取工具执行计划
+   * @param {string} toolName - 工具名称
+   * @param {object} args - 工具参数
+   * @param {string} requestId - 请求 ID
+   * @returns {object|null} - 执行计划，如果工具不需要计划确认则返回 null
+   */
+  async getPlanFromAPI(toolName, args = {}, requestId = null) {
+    // 构建 URL，将 args 作为 query string
+    const queryParams = new URLSearchParams();
+    for (const [key, value] of Object.entries(args)) {
+      if (value !== undefined && value !== null && typeof value !== 'object') {
+        queryParams.append(key, String(value));
+      }
+    }
+    const queryString = queryParams.toString();
+    const url = `${this.centralAPI}/api/plan/${toolName}${queryString ? '?' + queryString : ''}`;
+    const reqId = requestId || 'no-id';
+
+    try {
+      const headers = {};
+      if (this.apiToken) {
+        headers['X-API-Key'] = this.apiToken;
+      }
+
+      console.error(`\n📋 [${reqId}] GET_PLAN: ${toolName}`);
+      console.error(`   URL: ${url}`);
+
+      const response = await fetch(url, { headers });
+
+      if (!response.ok) {
+        console.error(`❌ [${reqId}] GET_PLAN failed: ${response.status}`);
+        return null;
+      }
+
+      const data = await response.json();
+      console.error(`✅ [${reqId}] GET_PLAN: requires_plan=${data.requires_plan}`);
+
+      if (data.requires_plan && data.plan) {
+        return data.plan;
+      }
+      return null;
+
+    } catch (error) {
+      console.error(`❌ [${reqId}] GET_PLAN error: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
    * 从中心 API 获取 SQL 查询定义
    */
   async getQueriesFromAPI(toolName, args = {}, requestId = null) {
@@ -3191,7 +3240,52 @@ class ThinMCPServer {
         const processedArgs = await this.processFileArgs(args);
         console.error('   File processing completed');
 
-        // 0.5 检查是否有会话 ID，恢复之前的中间结果
+        // 0.5 Plan 确认机制：如果工具需要计划确认且用户未确认，先返回 plan
+        if (!processedArgs.confirmed) {
+          const plan = await this.getPlanFromAPI(toolName, processedArgs, requestId);
+          if (plan) {
+            console.error(`   📋 Tool requires plan confirmation, returning plan`);
+
+            // 格式化 plan 为 Markdown
+            let planMarkdown = `## 📋 执行计划\n\n`;
+            planMarkdown += `**${plan.description}**\n\n`;
+            if (plan.target) {
+              planMarkdown += `**目标**: ${plan.target}\n\n`;
+            }
+
+            // 检查是否有任何步骤包含 description
+            const hasDescription = (plan.steps || []).some(s => s.description);
+
+            if (hasDescription) {
+              planMarkdown += `| 步骤 | 名称 | 说明 |\n`;
+              planMarkdown += `|------|------|------|\n`;
+              for (const step of plan.steps || []) {
+                planMarkdown += `| ${step.step} | ${step.name} | ${step.description || '-'} |\n`;
+              }
+            } else {
+              planMarkdown += `| 步骤 | 名称 |\n`;
+              planMarkdown += `|------|------|\n`;
+              for (const step of plan.steps || []) {
+                planMarkdown += `| ${step.step} | ${step.name} |\n`;
+              }
+            }
+
+            if (plan.estimated_time) {
+              planMarkdown += `\n**预估耗时**: ${plan.estimated_time}\n`;
+            }
+            planMarkdown += `\n---\n`;
+            planMarkdown += `\n💡 **请确认后继续执行**：再次调用此工具并添加 \`confirmed: true\` 参数\n`;
+
+            return {
+              content: [{ type: 'text', text: planMarkdown }],
+              isError: false,
+            };
+          }
+        } else {
+          console.error('   ✅ Plan confirmed, proceeding with execution');
+        }
+
+        // 0.6 检查是否有会话 ID，恢复之前的中间结果
         let restoredResults = {};
         if (processedArgs.session_id) {
           const sessionData = this.getSession(processedArgs.session_id);
