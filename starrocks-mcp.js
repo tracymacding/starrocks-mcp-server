@@ -3134,33 +3134,13 @@ class ThinMCPServer {
     const currentStep = step.step || '?';
 
     // 简短的进度信息
-    let report = `⏳ 进度 ${currentStep}/${totalSteps}: ${step.name || analysis.phase || '未知步骤'}\n\n`;
+    let report = `⏳ 进度 ${currentStep}/${totalSteps}: ${step.name || analysis.phase || '未知步骤'}`;
 
     // 只显示一行结果摘要
     if (step.result_summary) {
       // 截取第一行作为简短摘要
       const firstLine = step.result_summary.split('\n')[0];
-      report += `📊 ${firstLine}\n\n`;
-    }
-
-    // 下一步提示
-    if (analysis.next_step) {
-      report += `⏭️ 下一步: ${analysis.next_step.name}\n\n`;
-    }
-
-    // 继续调用的参数（简化格式）
-    if (analysis.next_action && analysis.next_action.call_with) {
-      const callWith = { ...analysis.next_action.call_with };
-      if (sessionId && !callWith.session_id) {
-        callWith.session_id = sessionId;
-      }
-      // 只显示关键参数
-      const briefParams = {
-        session_id: callWith.session_id,
-        label: callWith.label,
-        continue_from_step: callWith.continue_from_step,
-      };
-      report += `📝 继续调用: \`${analysis.next_action.tool}(${JSON.stringify(briefParams)})\`\n`;
+      report += ` | ${firstLine}`;
     }
 
     return report;
@@ -3208,20 +3188,48 @@ class ThinMCPServer {
 
       // 进度通知辅助函数
       const sendProgress = (progress, total, message) => {
+        const logFile = '/tmp/mcp_progress_debug.log';
+        const timestamp = new Date().toISOString();
+
+        const log = (msg) => {
+          console.error(msg);
+          try {
+            fs.appendFileSync(logFile, `[${timestamp}] ${msg}\n`);
+          } catch (e) {}
+        };
+
+        log(`   [DEBUG-sendProgress] Called with: progress=${progress}, total=${total}, message="${message}"`);
+        log(`   [DEBUG-sendProgress] extra exists: ${!!extra}, extra.sendNotification exists: ${!!(extra && extra.sendNotification)}`);
+        log(`   [DEBUG-sendProgress] request object: ${JSON.stringify(request, null, 2).substring(0, 500)}`);
+        log(`   [DEBUG-sendProgress] request.id: ${request.id}`);
+        log(`   [DEBUG-sendProgress] request.params._meta: ${JSON.stringify(request.params._meta)}`);
+
         if (extra && extra.sendNotification) {
           try {
+            // 使用客户端提供的 progressToken 或 Claude Code 的 toolUseId
+            const progressToken = request.params._meta?.progressToken
+              || request.params._meta?.['claudecode/toolUseId']
+              || String(request.id);
+            log(`   [DEBUG-sendProgress] progressToken: ${progressToken}`);
+            log(`   [DEBUG-sendProgress] Sending notification...`);
+
             extra.sendNotification({
               method: 'notifications/progress',
               params: {
-                progressToken: request.id,
+                progressToken,
                 progress,
                 total,
                 message,
               },
             });
+
+            log(`   [Progress] ✅ Progress notification sent: ${progress}/${total} - ${message}`);
           } catch (e) {
-            console.error(`   [Progress] Failed to send progress: ${e.message}`);
+            log(`   [Progress] ❌ Failed to send progress: ${e.message}`);
+            log(`   [Progress] Error stack: ${e.stack}`);
           }
+        } else {
+          log(`   [Progress] ❌ Cannot send: extra or sendNotification not available`);
         }
       };
 
@@ -3411,6 +3419,7 @@ class ThinMCPServer {
         };
 
         console.error(`\n   📍 [阶段 1] 初始分析...`);
+        console.error(`   [DEBUG] Sending initial progress notification...`);
         sendProgress(1, 5, '阶段 1: 初始分析...');
         console.error(
           '   Step 3: Sending results to Central API for analysis...',
@@ -3425,6 +3434,12 @@ class ThinMCPServer {
         // 3.5 处理多阶段查询（如存储放大分析的 schema 检测）
         let phaseCount = 1;
         const maxPhases = 10; // 防止无限循环（需要支持 6+ 阶段的 analyze_slow_load_job）
+
+        console.error(`   [DEBUG] Initial analysis result:`);
+        console.error(`   [DEBUG] - status: ${analysis.status}`);
+        console.error(`   [DEBUG] - step: ${analysis.step}, total_steps: ${analysis.total_steps}`);
+        console.error(`   [DEBUG] - step_name: ${analysis.step_name}`);
+        console.error(`   [DEBUG] - phase: ${analysis.phase}`);
 
         // 处理 step_completed 状态：存储会话并返回给客户端，让其更新 TODO 后再调用下一步
         if (analysis.status === 'step_completed') {
@@ -3468,16 +3483,35 @@ class ThinMCPServer {
           };
         }
 
+        console.error(`   [DEBUG] Checking while loop condition: status=${analysis.status}, phaseCount=${phaseCount}, maxPhases=${maxPhases}`);
+
         while (
           analysis.status === 'needs_more_queries' &&
           phaseCount < maxPhases
         ) {
           phaseCount++;
+          console.error(`   [DEBUG] ========== Entered while loop, phaseCount=${phaseCount} ==========`);
 
-          // 用户友好的进度显示
-          const phaseName = phaseNames[analysis.phase] || analysis.phase;
-          console.error(`\n   📍 [阶段 ${phaseCount}/${maxPhases}] ${phaseName}...`);
-          sendProgress(phaseCount, maxPhases, `阶段 ${phaseCount}: ${phaseName}...`);
+          // 优先使用步骤级别的进度信息（用于细粒度进度通知）
+          if (analysis.step && analysis.total_steps) {
+            // 步骤级别的进度通知
+            const stepName = analysis.step_name || analysis.phase_name || '执行中';
+            console.error(`\n   📍 [步骤 ${analysis.step}/${analysis.total_steps}] ${stepName}...`);
+            console.error(`   [DEBUG] Calling sendProgress with step-level info...`);
+            sendProgress(
+              analysis.step,
+              analysis.total_steps,
+              `步骤 ${analysis.step}/${analysis.total_steps}: ${stepName}`
+            );
+            console.error(`   [DEBUG] sendProgress called successfully`);
+          } else {
+            // 降级到阶段级别的进度通知
+            const phaseName = phaseNames[analysis.phase] || analysis.phase;
+            console.error(`\n   📍 [阶段 ${phaseCount}/${maxPhases}] ${phaseName}...`);
+            console.error(`   [DEBUG] Calling sendProgress with phase-level info...`);
+            sendProgress(phaseCount, maxPhases, `阶段 ${phaseCount}: ${phaseName}...`);
+            console.error(`   [DEBUG] sendProgress called successfully`);
+          }
 
           console.error(
             `   Step 3.${phaseCount}: Multi-phase query detected (${analysis.phase})`,
@@ -3818,7 +3852,16 @@ class ThinMCPServer {
             nextArgs,
             requestId,
           );
+
+          console.error(`   [DEBUG] Re-analysis result:`);
+          console.error(`   [DEBUG] - status: ${analysis.status}`);
+          console.error(`   [DEBUG] - step: ${analysis.step}, total_steps: ${analysis.total_steps}`);
+          console.error(`   [DEBUG] - step_name: ${analysis.step_name}`);
+          console.error(`   [DEBUG] - phase: ${analysis.phase}`);
         }
+
+        console.error(`   [DEBUG] ========== Exited while loop ==========`);
+        console.error(`   [DEBUG] Final status: ${analysis.status}, phaseCount: ${phaseCount}/${maxPhases}`);
 
         if (phaseCount >= maxPhases) {
           console.error(
