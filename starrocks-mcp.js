@@ -3474,10 +3474,22 @@ class ThinMCPServer {
         ) {
           phaseCount++;
 
-          // 用户友好的进度显示
-          const phaseName = phaseNames[analysis.phase] || analysis.phase;
-          console.error(`\n   📍 [阶段 ${phaseCount}/${maxPhases}] ${phaseName}...`);
-          sendProgress(phaseCount, maxPhases, `阶段 ${phaseCount}: ${phaseName}...`);
+          // 优先使用步骤级别的进度信息（用于细粒度进度通知）
+          if (analysis.step && analysis.total_steps) {
+            // 步骤级别的进度通知
+            const stepName = analysis.step_name || analysis.phase_name || '执行中';
+            console.error(`\n   📍 [步骤 ${analysis.step}/${analysis.total_steps}] ${stepName}...`);
+            sendProgress(
+              analysis.step,
+              analysis.total_steps,
+              `步骤 ${analysis.step}/${analysis.total_steps}: ${stepName}`
+            );
+          } else {
+            // 降级到阶段级别的进度通知
+            const phaseName = phaseNames[analysis.phase] || analysis.phase;
+            console.error(`\n   📍 [阶段 ${phaseCount}/${maxPhases}] ${phaseName}...`);
+            sendProgress(phaseCount, maxPhases, `阶段 ${phaseCount}: ${phaseName}...`);
+          }
 
           console.error(
             `   Step 3.${phaseCount}: Multi-phase query detected (${analysis.phase})`,
