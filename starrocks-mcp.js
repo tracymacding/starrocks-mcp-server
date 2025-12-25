@@ -675,6 +675,35 @@ class ThinMCPServer {
   }
 
   /**
+   * 生成确定性的会话 Key（基于参数组合）
+   * 用于自动识别同一个分析会话，无需客户端传递 session_id
+   */
+  generateDeterministicSessionKey(toolName, args) {
+    const keyParams = {
+      tool: toolName,
+      hours: args.hours || 24,
+      focus: args.focus || 'health',
+      database_name: args.database_name || '',
+      table_name: args.table_name || '',
+    };
+    return `${toolName}__${Buffer.from(JSON.stringify(keyParams)).toString('base64').slice(0, 20)}`;
+  }
+
+  /**
+   * 根据确定性 key 查找活跃会话
+   */
+  findActiveSessionByKey(sessionKey) {
+    for (const [sessionId, session] of this.sessionStorage.entries()) {
+      if (session.data?.sessionKey === sessionKey &&
+          Date.now() - session.timestamp < this.sessionTTL) {
+        console.error(`   🔍 找到活跃会话: ${sessionId}`);
+        return { sessionId, data: session.data };
+      }
+    }
+    return null;
+  }
+
+  /**
    * 存储会话数据
    */
   storeSession(sessionId, data) {
@@ -3293,13 +3322,28 @@ class ThinMCPServer {
           console.error('   ✅ Plan confirmed, proceeding with execution');
         }
 
-        // 0.6 检查是否有会话 ID，恢复之前的中间结果
+        // 0.6 自动恢复之前的中间结果（基于参数组合自动识别会话）
         let restoredResults = {};
+        let activeSessionId = null;
+        const sessionKey = this.generateDeterministicSessionKey(toolName, processedArgs);
+
+        // 优先使用传入的 session_id，否则自动查找
         if (processedArgs.session_id) {
           const sessionData = this.getSession(processedArgs.session_id);
           if (sessionData) {
             restoredResults = sessionData.results || {};
-            console.error(`   恢复了 ${Object.keys(restoredResults).length} 个中间结果字段`);
+            activeSessionId = processedArgs.session_id;
+            console.error(`   🔄 通过 session_id 恢复了 ${Object.keys(restoredResults).length} 个中间结果字段`);
+          }
+        } else {
+          // 自动查找匹配的活跃会话
+          const activeSession = this.findActiveSessionByKey(sessionKey);
+          if (activeSession) {
+            restoredResults = activeSession.data.results || {};
+            activeSessionId = activeSession.sessionId;
+            console.error(`   🔄 自动恢复了 ${Object.keys(restoredResults).length} 个中间结果字段`);
+          } else {
+            console.error(`   [DEBUG] 首次调用，创建新会话`);
           }
         }
 
@@ -3327,8 +3371,18 @@ class ThinMCPServer {
         if (regularQueries.length > 0) {
           console.error('   Step 2: Executing SQL queries locally...');
           const queryResults = await this.executeQueries(regularQueries, requestId);
+          // 调试：检查 queryResults 是否包含 _intermediate（不应该包含）
+          if (queryResults._intermediate) {
+            console.error(`   [DEBUG] 警告：queryResults 包含 _intermediate！这可能覆盖已恢复的数据`);
+          }
           // 合并查询结果，保留已恢复的会话数据
           results = { ...results, ...queryResults };
+          // 调试：合并后检查 _intermediate 是否仍然存在
+          if (results._intermediate) {
+            console.error(`   [DEBUG] 合并后 results._intermediate 仍然存在，keys: ${Object.keys(results._intermediate).join(', ')}`);
+          } else {
+            console.error(`   [DEBUG] 合并后 results._intermediate 不存在`);
+          }
           console.error('   SQL execution completed');
         } else {
           console.error(
@@ -3424,6 +3478,12 @@ class ThinMCPServer {
         console.error(
           '   Step 3: Sending results to Central API for analysis...',
         );
+        // 调试：发送给中央 API 前检查 _intermediate
+        if (results._intermediate) {
+          console.error(`   [DEBUG] 发送给 API 的 results._intermediate keys: ${Object.keys(results._intermediate).join(', ')}`);
+        } else {
+          console.error(`   [DEBUG] 发送给 API 的 results 中没有 _intermediate`);
+        }
         let analysis = await this.analyzeResultsWithAPI(
           toolName,
           results,
@@ -3445,11 +3505,12 @@ class ThinMCPServer {
         if (analysis.status === 'step_completed') {
           console.error(`\n   ✅ 步骤完成: ${analysis.completed_step?.name || analysis.phase}`);
 
-          // 生成或复用会话 ID
-          const sessionId = processedArgs.session_id || this.generateSessionId(toolName);
+          // 复用已有会话 ID 或生成新的
+          const sessionId = activeSessionId || this.generateSessionId(toolName);
 
-          // 存储当前结果和中间数据
+          // 存储当前结果和中间数据（包含 sessionKey 用于自动查找）
           const sessionData = {
+            sessionKey,  // 用于自动识别会话
             results: {
               ...results,
               _intermediate: analysis._intermediate,
@@ -3458,11 +3519,7 @@ class ThinMCPServer {
             lastCompletedStep: analysis.completed_step?.step || 0,
           };
           this.storeSession(sessionId, sessionData);
-
-          // 在 next_action.call_with 中添加 session_id
-          if (analysis.next_action && analysis.next_action.call_with) {
-            analysis.next_action.call_with.session_id = sessionId;
-          }
+          console.error(`   💾 Session ${sessionId} 已存储 (key: ${sessionKey})`);
 
           const stepReport = this.formatStepCompletedReport(analysis, sessionId);
           return {
@@ -3920,20 +3977,17 @@ class ThinMCPServer {
         if (analysis.status === 'step_completed') {
           console.error(`\n   ✅ 步骤完成 (循环后): ${analysis.completed_step?.name || analysis.phase}`);
 
-          // 存储会话数据
-          const sessionId = processedArgs.session_id || this.generateSessionId(toolName);
+          // 复用已有会话 ID 或生成新的
+          const sessionId = activeSessionId || this.generateSessionId(toolName);
           const sessionData = {
+            sessionKey,  // 用于自动识别会话
             results: { ...results, _intermediate: analysis._intermediate },
             processedArgs,
             toolName,
             timestamp: Date.now(),
           };
           this.storeSession(sessionId, sessionData);
-
-          // 确保下一步调用参数中包含 session_id
-          if (analysis.next_action && analysis.next_action.call_with) {
-            analysis.next_action.call_with.session_id = sessionId;
-          }
+          console.error(`   💾 Session ${sessionId} 已存储 (key: ${sessionKey})`);
 
           const stepReport = this.formatStepCompletedReport(analysis, sessionId);
           return {
