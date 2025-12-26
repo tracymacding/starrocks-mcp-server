@@ -689,7 +689,9 @@ class ThinMCPServer {
       // analyze_slow_load_job 特有参数
       label: args.label || '',
     };
-    return `${toolName}__${Buffer.from(JSON.stringify(keyParams)).toString('base64').slice(0, 20)}`;
+    // 使用完整的 base64 编码，避免因截取过短导致不同参数的 key 碰撞
+    // 例如 hours=4 和 hours=24 的前20字符相同，会导致错误复用缓存
+    return `${toolName}__${Buffer.from(JSON.stringify(keyParams)).toString('base64')}`;
   }
 
   /**
@@ -3325,7 +3327,18 @@ class ThinMCPServer {
             console.error(`   📋 First call detected, returning execution plan`);
 
             // 格式化 plan 为 Markdown
-            let planMarkdown = `## 📋 执行计划\n\n`;
+            const stepCount = (plan.steps || []).length;
+
+            // TODO 创建指令放在最开头，使用强制性措辞
+            let planMarkdown = `<todo_instruction>\n`;
+            planMarkdown += `🚨 **CRITICAL**: 在继续执行前，你必须先使用 TodoWrite 工具创建任务列表。\n`;
+            planMarkdown += `请创建包含以下 ${stepCount} 个步骤的 TODO 列表：\n`;
+            for (const step of plan.steps || []) {
+              planMarkdown += `- 步骤 ${step.step}: ${step.name}\n`;
+            }
+            planMarkdown += `</todo_instruction>\n\n`;
+
+            planMarkdown += `## 📋 执行计划\n\n`;
             planMarkdown += `**${plan.description}**\n\n`;
             if (plan.target) {
               planMarkdown += `**目标**: ${plan.target}\n\n`;
@@ -3353,12 +3366,6 @@ class ThinMCPServer {
             }
             planMarkdown += `\n---\n`;
             planMarkdown += `\n💡 **继续执行**：再次调用此工具开始执行（工具会自动继续）\n`;
-
-            // 添加 TODO 创建指令
-            planMarkdown += `\n⚠️ **Claude 请注意**：请立即使用 TodoWrite 工具创建以下步骤的 TODO 列表，然后再调用本工具继续执行：\n`;
-            for (const step of plan.steps || []) {
-              planMarkdown += `- 步骤 ${step.step}: ${step.name}\n`;
-            }
 
             // 创建会话以便下次调用时能识别这不是首次调用
             const sessionId = this.generateSessionId(toolName);
