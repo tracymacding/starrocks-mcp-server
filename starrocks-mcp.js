@@ -758,7 +758,7 @@ class ThinMCPServer {
    * 获取本地定义的 tools（不依赖中心服务器）
    */
   getLocalToolDefinitions() {
-    return [
+    const allTools = [
       {
         name: 'get_query_profile',
         description: '获取指定 Query ID 的执行 Profile，保存到本地文件并返回摘要信息。Profile 文件可用于后续详细分析。',
@@ -775,6 +775,7 @@ class ThinMCPServer {
       },
       {
         name: 'analyze_load_profile',
+        hidden: true,  // 内部工具，由 analyze_slow_load_job 调用
         description: '📊 Load Profile 深度分析 - 分析本地 Load Profile 文件，使用 LLM 进行两阶段深度分析（瓶颈定位 + 根因分析）',
         inputSchema: {
           type: 'object',
@@ -793,6 +794,7 @@ class ThinMCPServer {
       },
       {
         name: 'check_disk_io',
+        hidden: true,  // 内部工具，由 analyze_slow_load_job 调用
         description: '🔍 检查磁盘 IO 利用率 - 查询 Prometheus 获取指定时间范围内 BE 节点 Spill 磁盘的 IO 利用率，用于诊断导入性能瓶颈',
         inputSchema: {
           type: 'object',
@@ -815,6 +817,9 @@ class ThinMCPServer {
         },
       },
     ];
+
+    // 过滤掉标记为 hidden 的工具
+    return allTools.filter(t => !t.hidden);
   }
 
   // ========== Solution C 模式说明 ==========
