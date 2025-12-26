@@ -681,10 +681,13 @@ class ThinMCPServer {
   generateDeterministicSessionKey(toolName, args) {
     const keyParams = {
       tool: toolName,
+      // 通用参数
       hours: args.hours || 24,
       focus: args.focus || 'health',
       database_name: args.database_name || '',
       table_name: args.table_name || '',
+      // analyze_slow_load_job 特有参数
+      label: args.label || '',
     };
     return `${toolName}__${Buffer.from(JSON.stringify(keyParams)).toString('base64').slice(0, 20)}`;
   }
@@ -942,9 +945,13 @@ class ThinMCPServer {
    * 本地处理 fetch_logs 工具（避免嵌套调用）
    */
   async handleFetchLogsLocally(args, requestId = null) {
-    const { nodes = [], keyword = '', last_hours = 2, log_level = 'INFO', context_lines = 0 } = args;
+    const { nodes = [], keyword = '', keywords = [], last_hours = 2, log_level = 'INFO', context_lines = 0 } = args;
 
-    console.error(`      📋 Local fetch_logs: ${nodes.length} nodes, keyword="${keyword}"`);
+    // 支持单个 keyword 或多个 keywords 数组
+    const keywordList = keywords.length > 0 ? keywords : (keyword ? [keyword] : []);
+
+    console.error(`      📋 Local fetch_logs: ${nodes.length} nodes, keywords=${JSON.stringify(keywordList)}`);
+    console.error(`      📋 fetch_logs args: ${JSON.stringify(args, null, 2)}`);
 
     // 阶段1：发现日志路径
     console.error(`         Step 1: Discovering log paths...`);
@@ -992,8 +999,13 @@ class ThinMCPServer {
       console.error(`         📂 Find command: ${findCmd}`);
       console.error(`         📂 mtime days: ${mtimeDays}, last_hours: ${last_hours}`);
 
-      if (keyword) {
-        fetchCmd += ` | xargs grep -ah "${keyword}"`;  // -h 去掉文件名前缀, -a 强制处理二进制文件
+      if (keywordList.length > 0) {
+        // 多个关键词用多个 grep 命令链起来
+        // 例如: find ... | xargs grep -ah "finish transaction" | grep "59886"
+        fetchCmd += ` | xargs grep -ah "${keywordList[0]}"`;  // -h 去掉文件名前缀, -a 强制处理二进制文件
+        for (let i = 1; i < keywordList.length; i++) {
+          fetchCmd += ` | grep "${keywordList[i]}"`;
+        }
         if (context_lines > 0) {
           fetchCmd += ` -A ${context_lines} -B ${context_lines}`;
         }
@@ -3282,11 +3294,35 @@ class ThinMCPServer {
         const processedArgs = await this.processFileArgs(args);
         console.error('   File processing completed');
 
-        // 0.5 Plan 确认机制：如果工具需要计划确认且用户未确认，先返回 plan
-        if (!processedArgs.confirmed) {
+        // 0.5 Plan 机制：先检查会话，再决定是否返回执行计划
+        // 生成会话键，用于查找活跃会话
+        const sessionKey = this.generateDeterministicSessionKey(toolName, processedArgs);
+
+        // 检查是否有活跃会话（自动恢复机制）
+        // 如果 force_new=true，则跳过会话恢复，强制重新执行
+        let hasActiveSession = false;
+        if (processedArgs.force_new) {
+          console.error(`   🔄 force_new=true, 跳过会话恢复，强制重新执行`);
+          // 清除该 sessionKey 对应的旧会话
+          const oldSession = this.findActiveSessionByKey(sessionKey);
+          if (oldSession) {
+            this.deleteSession(oldSession.id);
+            console.error(`   🗑️ 已清除旧会话: ${oldSession.id}`);
+          }
+          hasActiveSession = false;
+        } else if (processedArgs.session_id) {
+          hasActiveSession = !!this.getSession(processedArgs.session_id);
+        } else {
+          hasActiveSession = !!this.findActiveSessionByKey(sessionKey);
+        }
+
+        // 首次调用（无 current_phase、无 session_id、且无活跃会话）时返回执行计划
+        const isFirstCall = !processedArgs.current_phase && !processedArgs.session_id && !hasActiveSession;
+
+        if (isFirstCall) {
           const plan = await this.getPlanFromAPI(toolName, processedArgs, requestId);
           if (plan) {
-            console.error(`   📋 Tool requires plan confirmation, returning plan`);
+            console.error(`   📋 First call detected, returning execution plan`);
 
             // 格式化 plan 为 Markdown
             let planMarkdown = `## 📋 执行计划\n\n`;
@@ -3316,7 +3352,24 @@ class ThinMCPServer {
               planMarkdown += `\n**预估耗时**: ${plan.estimated_time}\n`;
             }
             planMarkdown += `\n---\n`;
-            planMarkdown += `\n💡 **请确认后继续执行**：再次调用此工具并添加 \`confirmed: true\` 参数\n`;
+            planMarkdown += `\n💡 **继续执行**：再次调用此工具开始执行（工具会自动继续）\n`;
+
+            // 添加 TODO 创建指令
+            planMarkdown += `\n⚠️ **Claude 请注意**：请立即使用 TodoWrite 工具创建以下步骤的 TODO 列表，然后再调用本工具继续执行：\n`;
+            for (const step of plan.steps || []) {
+              planMarkdown += `- 步骤 ${step.step}: ${step.name}\n`;
+            }
+
+            // 创建会话以便下次调用时能识别这不是首次调用
+            const sessionId = this.generateSessionId(toolName);
+            const sessionData = {
+              sessionKey,
+              results: { _plan_shown: true },  // 标记 plan 已展示
+              args: processedArgs,
+              lastCompletedStep: 0,
+            };
+            this.storeSession(sessionId, sessionData);
+            console.error(`   💾 Session ${sessionId} created for plan display`);
 
             return {
               content: [{ type: 'text', text: planMarkdown }],
@@ -3324,21 +3377,22 @@ class ThinMCPServer {
             };
           }
         } else {
-          console.error('   ✅ Plan confirmed, proceeding with execution');
+          console.error('   ✅ Continuing execution from previous state');
         }
 
         // 0.6 自动恢复之前的中间结果（基于参数组合自动识别会话）
         let restoredResults = {};
         let activeSessionId = null;
-        const sessionKey = this.generateDeterministicSessionKey(toolName, processedArgs);
 
         // 优先使用传入的 session_id，否则自动查找
+        let lastCompletedStep = 0;
         if (processedArgs.session_id) {
           const sessionData = this.getSession(processedArgs.session_id);
           if (sessionData) {
             restoredResults = sessionData.results || {};
             activeSessionId = processedArgs.session_id;
-            console.error(`   🔄 通过 session_id 恢复了 ${Object.keys(restoredResults).length} 个中间结果字段`);
+            lastCompletedStep = sessionData.lastCompletedStep || 0;
+            console.error(`   🔄 通过 session_id 恢复了 ${Object.keys(restoredResults).length} 个中间结果字段, lastCompletedStep=${lastCompletedStep}`);
           }
         } else {
           // 自动查找匹配的活跃会话
@@ -3346,9 +3400,36 @@ class ThinMCPServer {
           if (activeSession) {
             restoredResults = activeSession.data.results || {};
             activeSessionId = activeSession.sessionId;
-            console.error(`   🔄 自动恢复了 ${Object.keys(restoredResults).length} 个中间结果字段`);
+            lastCompletedStep = activeSession.data.lastCompletedStep || 0;
+            console.error(`   🔄 自动恢复了 ${Object.keys(restoredResults).length} 个中间结果字段, lastCompletedStep=${lastCompletedStep}`);
           } else {
             console.error(`   [DEBUG] 首次调用，创建新会话`);
+          }
+        }
+
+        // 如果有已完成的步骤，设置 continue_from_step 参数告诉 API 从下一步继续
+        if (lastCompletedStep > 0) {
+          processedArgs.continue_from_step = lastCompletedStep + 1;
+          console.error(`   📍 设置 continue_from_step=${processedArgs.continue_from_step} (上次完成步骤 ${lastCompletedStep})`);
+
+          // 将恢复的中间结果合并到 processedArgs 中（API 端从 args 中读取这些值）
+          const intermediateKeys = ['load_job_info', 'load_profile_content', 'profile_analysis', 'fe_transaction_analysis'];
+
+          // 首先从 _intermediate 对象中恢复（Central API 将中间结果存储在这里）
+          const intermediate = restoredResults._intermediate || {};
+          for (const key of intermediateKeys) {
+            if (intermediate[key] && !processedArgs[key]) {
+              processedArgs[key] = intermediate[key];
+              console.error(`   📦 从 _intermediate 恢复: ${key}`);
+            }
+          }
+
+          // 然后从根级别恢复（兼容旧的存储方式）
+          for (const key of intermediateKeys) {
+            if (restoredResults[key] && !processedArgs[key]) {
+              processedArgs[key] = restoredResults[key];
+              console.error(`   📦 从根级别恢复: ${key}`);
+            }
           }
         }
 
@@ -3535,12 +3616,22 @@ class ThinMCPServer {
 
         // 处理 needs_selection 状态：返回任务列表让用户选择
         if (analysis.status === 'needs_selection') {
-          console.error(`\n   🔍 需要用户选择: 找到 ${analysis.jobs_count || 'N/A'} 个匹配任务`);
+          console.error(`\n   🔍 需要用户选择: 找到 ${analysis.jobs_count || analysis.jobs?.length || 'N/A'} 个匹配任务`);
 
-          // 直接返回报告，让用户看到任务列表并选择
-          const report = analysis.report || analysis.message || '请选择要分析的任务';
+          // 构建选择报告，包含任务列表
+          let selectionReport = analysis.message || '请选择要分析的任务';
+          if (analysis.display_table) {
+            selectionReport += '\n\n' + analysis.display_table;
+          }
+          if (analysis.next_action) {
+            selectionReport += `\n\n💡 ${analysis.next_action.instruction}`;
+          }
+
+          // 添加指令，提醒 Claude 询问用户选择
+          selectionReport += `\n\n⚠️ **Claude 请注意**：请询问用户要分析哪个任务（提供序号），不要自行选择。`;
+
           return {
-            content: [{ type: 'text', text: report }],
+            content: [{ type: 'text', text: selectionReport }],
             _raw: analysis,
           };
         }
@@ -3990,6 +4081,7 @@ class ThinMCPServer {
             processedArgs,
             toolName,
             timestamp: Date.now(),
+            lastCompletedStep: analysis.completed_step?.step || 0,  // 记录已完成步骤
           };
           this.storeSession(sessionId, sessionData);
           console.error(`   💾 Session ${sessionId} 已存储 (key: ${sessionKey})`);
@@ -3997,6 +4089,29 @@ class ThinMCPServer {
           const stepReport = this.formatStepCompletedReport(analysis, sessionId);
           return {
             content: [{ type: 'text', text: stepReport }],
+            _raw: analysis,
+          };
+        }
+
+        // 检查 while 循环后是否变为 needs_selection 状态
+        // 这种情况发生在 needs_more_queries 循环中调用返回 needs_selection 时
+        if (analysis.status === 'needs_selection') {
+          console.error(`\n   🔍 需要用户选择 (循环后): 找到 ${analysis.jobs_count || analysis.jobs?.length || 'N/A'} 个匹配任务`);
+
+          // 构建选择报告，包含任务列表
+          let selectionReport = analysis.message || '请选择要分析的任务';
+          if (analysis.display_table) {
+            selectionReport += '\n\n' + analysis.display_table;
+          }
+          if (analysis.next_action) {
+            selectionReport += `\n\n💡 ${analysis.next_action.instruction}`;
+          }
+
+          // 添加指令，提醒 Claude 询问用户选择
+          selectionReport += `\n\n⚠️ **Claude 请注意**：请询问用户要分析哪个任务（提供序号），不要自行选择。`;
+
+          return {
+            content: [{ type: 'text', text: selectionReport }],
             _raw: analysis,
           };
         }
