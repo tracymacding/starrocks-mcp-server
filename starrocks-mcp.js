@@ -2932,6 +2932,46 @@ class ThinMCPServer {
       briefSummary += '📊 **关键发现**\n';
       briefSummary += `- 分析事务数: ${summary.total_transactions || 0}\n`;
       briefSummary += `- 发现问题数: ${summary.issues_found || 0}\n`;
+    } else if (analysis.overview || analysis.slow_jobs) {
+      // analyze_slow_compaction_jobs 等 Compaction 分析工具（结构化数据）
+      briefSummary += '📊 **Compaction 分析摘要**\n';
+      if (analysis.overview) {
+        const ov = analysis.overview;
+        briefSummary += `- 总 Jobs 数: ${ov.total_jobs || 0}\n`;
+        briefSummary += `- 慢任务数: ${ov.slow_completed_count || 0}\n`;
+        if (ov.slowest_duration_minutes) {
+          briefSummary += `- 最慢任务耗时: ${ov.slowest_duration_minutes.toFixed(1)} 分钟\n`;
+        }
+      }
+      if (analysis.issues && analysis.issues.length > 0) {
+        briefSummary += `- 发现问题: ${analysis.issues.length} 个\n`;
+      }
+      if (analysis.recommendations && analysis.recommendations.length > 0) {
+        briefSummary += `- 优化建议: ${analysis.recommendations.length} 条\n`;
+      }
+    } else if (analysis.report && typeof analysis.report === 'string') {
+      // 从 report 字段中提取摘要信息
+      const report = analysis.report;
+      if (report.includes('Compaction 慢任务') || report.includes('Compaction 健康')) {
+        briefSummary += '📊 **Compaction 分析摘要**\n';
+        // 尝试从报告中提取关键数据
+        const jobsMatch = report.match(/总 Jobs 数[^\d]*(\d+)/);
+        const slowMatch = report.match(/慢任务[（(]已完成[）)][^\d]*(\d+)/);
+        const durationMatch = report.match(/最慢任务耗时[^\d]*([\d.]+)\s*分钟/);
+        const issuesMatch = report.match(/问题诊断[\s\S]*?(?:🔴|🟠|🟡)/g);
+        const recommendsMatch = report.match(/优化建议[\s\S]*?(?:\d+\.)/g);
+
+        if (jobsMatch) briefSummary += `- 总 Jobs 数: ${jobsMatch[1]}\n`;
+        if (slowMatch) briefSummary += `- 慢任务数: ${slowMatch[1]}\n`;
+        if (durationMatch) briefSummary += `- 最慢任务耗时: ${durationMatch[1]} 分钟\n`;
+        if (issuesMatch) briefSummary += `- 发现问题: ${issuesMatch.length} 个\n`;
+      } else if (report.includes('数据导入') || report.includes('Load')) {
+        briefSummary += '📊 **导入分析摘要**\n';
+        briefSummary += '- 详细信息请查看完整报告\n';
+      } else {
+        briefSummary += '📊 **分析摘要**\n';
+        briefSummary += '- 详细信息请查看完整报告\n';
+      }
     } else if (analysis.diagnosis_results) {
       briefSummary += '📊 **诊断摘要**\n';
       briefSummary += `- ${analysis.diagnosis_results.summary || '分析完成'}\n`;
@@ -3181,8 +3221,10 @@ class ThinMCPServer {
     const totalSteps = analysis.total_steps || 6;
     const currentStep = step.step || '?';
 
-    // 简短的进度信息
-    let report = `⏳ 进度 ${currentStep}/${totalSteps}: ${step.name || analysis.phase || '未知步骤'}`;
+    // 简短的进度信息 - 明确表示步骤已完成
+    const stepName = step.name || analysis.phase || '未知步骤';
+
+    let report = `✅ 步骤 ${currentStep}/${totalSteps} 完成: ${stepName}`;
 
     // 只显示一行结果摘要
     if (step.result_summary) {
@@ -4186,6 +4228,19 @@ class ThinMCPServer {
 
         // 生成简短摘要
         const summary = this.generateBriefSummary(analysis, reportPath);
+
+        // 分析完成后清除会话，确保下次调用是全新分析
+        if (activeSessionId) {
+          this.deleteSession(activeSessionId);
+          console.error(`   🗑️ 分析完成，会话已清除: ${activeSessionId}`);
+        } else {
+          // 如果没有 activeSessionId，尝试通过 sessionKey 查找并清除
+          const sessionToDelete = this.findActiveSessionByKey(sessionKey);
+          if (sessionToDelete) {
+            this.deleteSession(sessionToDelete.sessionId);
+            console.error(`   🗑️ 分析完成，会话已清除: ${sessionToDelete.sessionId}`);
+          }
+        }
 
         return {
           content: [
