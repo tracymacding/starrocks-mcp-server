@@ -36,3 +36,6 @@ ecosystem.config.js
 
 # Local agent installation
 .starrocks-agent/
+
+# Claude Code local config
+.claude/

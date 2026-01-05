@@ -1662,6 +1662,7 @@ class ThinMCPServer {
                 partition_id: cmd.partition_id,
                 path: cmd.path,
                 storage_type: cmd.storage_type,
+                subdir: cmd.subdir || null,  // 保留子目录信息
                 success: true,
                 output: stdout.trim(),
                 execution_time_ms: duration,
@@ -1718,6 +1719,7 @@ class ThinMCPServer {
                 partition_id: cmd.partition_id,
                 path: cmd.path,
                 storage_type: cmd.storage_type,
+                subdir: cmd.subdir || null,  // 保留子目录信息
                 success: false,
                 error: error.message,
               };
@@ -3359,8 +3361,9 @@ class ThinMCPServer {
           hasActiveSession = !!this.findActiveSessionByKey(sessionKey);
         }
 
-        // 首次调用（无 current_phase、无 session_id、且无活跃会话）时返回执行计划
-        const isFirstCall = !processedArgs.current_phase && !processedArgs.session_id && !hasActiveSession;
+        // 首次调用（无 current_phase、无 session_id、无活跃会话、且未指定 continue_from_step）时返回执行计划
+        // 如果用户显式传入 continue_from_step，说明用户想跳过计划直接执行
+        const isFirstCall = !processedArgs.current_phase && !processedArgs.session_id && !hasActiveSession && !processedArgs.continue_from_step;
 
         if (isFirstCall) {
           const plan = await this.getPlanFromAPI(toolName, processedArgs, requestId);
@@ -3643,11 +3646,15 @@ class ThinMCPServer {
           const sessionId = activeSessionId || this.generateSessionId(toolName);
 
           // 存储当前结果和中间数据（包含 sessionKey 用于自动查找）
+          // 注意：_intermediate 需要合并而不是覆盖，以保留之前步骤的数据
           const sessionData = {
             sessionKey,  // 用于自动识别会话
             results: {
               ...results,
-              _intermediate: analysis._intermediate,
+              _intermediate: {
+                ...(results._intermediate || {}),  // 保留之前步骤的中间结果
+                ...analysis._intermediate,          // 合并当前步骤的中间结果
+              },
             },
             args: processedArgs,
             lastCompletedStep: analysis.completed_step?.step || 0,
@@ -3741,6 +3748,13 @@ class ThinMCPServer {
               results.garbage_size_summary = cliResults.cli_summary;
               console.error(
                 `   Garbage size query completed: ${cliResults.cli_summary.successful} success, ${cliResults.cli_summary.failed} failed`,
+              );
+            } else if (analysis.phase === 'get_partition_storage_sizes') {
+              // 表存储空间放大分析：分区存储大小查询
+              results.partition_storage_sizes = cliResults.cli_results;
+              results.partition_storage_sizes_summary = cliResults.cli_summary;
+              console.error(
+                `   Partition storage size query completed: ${cliResults.cli_summary.successful} success, ${cliResults.cli_summary.failed} failed`,
               );
             } else {
               // 默认使用 cli_results/cli_summary
@@ -4129,12 +4143,17 @@ class ThinMCPServer {
 
           // 复用已有会话 ID 或生成新的
           const sessionId = activeSessionId || this.generateSessionId(toolName);
+          // 注意：_intermediate 需要合并而不是覆盖，以保留之前步骤的数据
           const sessionData = {
             sessionKey,  // 用于自动识别会话
-            results: { ...results, _intermediate: analysis._intermediate },
-            processedArgs,
-            toolName,
-            timestamp: Date.now(),
+            results: {
+              ...results,
+              _intermediate: {
+                ...(results._intermediate || {}),  // 保留之前步骤的中间结果
+                ...analysis._intermediate,          // 合并当前步骤的中间结果
+              },
+            },
+            args: processedArgs,
             lastCompletedStep: analysis.completed_step?.step || 0,  // 记录已完成步骤
           };
           this.storeSession(sessionId, sessionData);
@@ -4168,6 +4187,40 @@ class ThinMCPServer {
             content: [{ type: 'text', text: selectionReport }],
             _raw: analysis,
           };
+        }
+
+        // 检查 while 循环后是否仍是 needs_more_queries 状态但有中间结果
+        // 这种情况发生在多步骤工具的某个步骤完成后，API 返回 needs_more_queries 表示还有后续步骤
+        if (analysis.status === 'needs_more_queries' && analysis._intermediate) {
+          console.error(`\n   📦 检测到中间结果，保存会话以便继续执行`);
+
+          // 检查是否有 completed_step 信息（表示某个步骤已完成）
+          const completedStep = analysis.completed_step?.step || analysis._intermediate?.completed_step || 0;
+          if (completedStep > 0) {
+            const sessionId = activeSessionId || this.generateSessionId(toolName);
+            // 注意：_intermediate 需要合并而不是覆盖，以保留之前步骤的数据
+            const sessionData = {
+              sessionKey,
+              results: {
+                ...results,
+                _intermediate: {
+                  ...(results._intermediate || {}),  // 保留之前步骤的中间结果
+                  ...analysis._intermediate,          // 合并当前步骤的中间结果
+                },
+              },
+              args: processedArgs,
+              lastCompletedStep: completedStep,
+            };
+            this.storeSession(sessionId, sessionData);
+            console.error(`   💾 Session ${sessionId} 已存储 (步骤 ${completedStep} 完成)`);
+
+            // 返回步骤完成报告
+            const stepReport = `✅ 步骤 ${completedStep}/? 完成\n\n💡 继续调用此工具执行下一步骤`;
+            return {
+              content: [{ type: 'text', text: stepReport }],
+              _raw: analysis,
+            };
+          }
         }
 
         // 显示总阶段数
