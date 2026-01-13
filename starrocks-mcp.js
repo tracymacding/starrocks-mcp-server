@@ -1135,14 +1135,11 @@ class ThinMCPServer {
             requestId,
           );
 
-          // 根据 phase 存储结果
-          if (analysis.phase === 'discover_log_paths') {
-            results.discovered_log_paths = sshResults.ssh_results;
-          } else if (analysis.phase === 'fetch_logs') {
-            results.log_contents = sshResults.ssh_results;
-          } else {
-            results = { ...results, ...sshResults };
-          }
+          // 使用 Central API 指定的结果键名，否则使用默认的 ssh_results/ssh_summary
+          const sshResultKey = analysis.ssh_result_key || 'ssh_results';
+          const sshSummaryKey = analysis.ssh_summary_key || 'ssh_summary';
+          results[sshResultKey] = sshResults.ssh_results;
+          results[sshSummaryKey] = sshResults.ssh_summary;
         }
 
         // 执行额外的 SQL 查询（如果需要）
@@ -3757,30 +3754,14 @@ class ThinMCPServer {
               requestId,
             );
 
-            // 根据 phase 使用不同的结果键名
-            if (analysis.phase === 'list_table_directories') {
-              results.dir_listing_results = cliResults.cli_results;
-              results.dir_listing_summary = cliResults.cli_summary;
-              console.error(
-                `   Directory listing completed: ${cliResults.cli_summary.successful} success, ${cliResults.cli_summary.failed} failed`,
-              );
-            } else if (analysis.phase === 'get_garbage_sizes') {
-              results.garbage_size_results = cliResults.cli_results;
-              results.garbage_size_summary = cliResults.cli_summary;
-              console.error(
-                `   Garbage size query completed: ${cliResults.cli_summary.successful} success, ${cliResults.cli_summary.failed} failed`,
-              );
-            } else if (analysis.phase === 'get_partition_storage_sizes') {
-              // 表存储空间放大分析：分区存储大小查询
-              results.partition_storage_sizes = cliResults.cli_results;
-              results.partition_storage_sizes_summary = cliResults.cli_summary;
-              console.error(
-                `   Partition storage size query completed: ${cliResults.cli_summary.successful} success, ${cliResults.cli_summary.failed} failed`,
-              );
-            } else {
-              // 默认使用 cli_results/cli_summary
-              results = { ...results, ...cliResults };
-            }
+            // 使用 Central API 指定的结果键名，默认 cli_results/cli_summary
+            const cliResultKey = analysis.cli_result_key || 'cli_results';
+            const cliSummaryKey = analysis.cli_summary_key || 'cli_summary';
+            results[cliResultKey] = cliResults.cli_results;
+            results[cliSummaryKey] = cliResults.cli_summary;
+            console.error(
+              `   CLI completed: ${cliResults.cli_summary.successful} success, ${cliResults.cli_summary.failed} failed -> ${cliResultKey}`,
+            );
           }
 
           // 检查是否需要执行 SSH 命令（用于日志分析）
@@ -3804,23 +3785,14 @@ class ThinMCPServer {
               requestId,
             );
 
-            // 根据 phase 使用不同的结果键名
-            if (analysis.phase === 'discover_log_paths') {
-              results.discovered_log_paths = sshResults.ssh_results;
-              results.discover_log_paths_summary = sshResults.ssh_summary;
-              console.error(
-                `   Log path discovery completed: ${sshResults.ssh_summary.successful} success, ${sshResults.ssh_summary.failed} failed`,
-              );
-            } else if (analysis.phase === 'fetch_logs') {
-              results.log_contents = sshResults.ssh_results;
-              results.fetch_logs_summary = sshResults.ssh_summary;
-              console.error(
-                `   Log fetch completed: ${sshResults.ssh_summary.successful} success, ${sshResults.ssh_summary.failed} failed`,
-              );
-            } else {
-              // 默认使用 ssh_results/ssh_summary
-              results = { ...results, ...sshResults };
-            }
+            // 使用 Central API 指定的结果键名，默认 ssh_results/ssh_summary
+            const sshResultKey = analysis.ssh_result_key || 'ssh_results';
+            const sshSummaryKey = analysis.ssh_summary_key || 'ssh_summary';
+            results[sshResultKey] = sshResults.ssh_results;
+            results[sshSummaryKey] = sshResults.ssh_summary;
+            console.error(
+              `   SSH completed: ${sshResults.ssh_summary.successful} success, ${sshResults.ssh_summary.failed} failed -> ${sshResultKey}`,
+            );
           }
 
           // 检查是否需要调用其他工具（工具间调用）
