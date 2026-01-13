@@ -947,12 +947,16 @@ class ThinMCPServer {
    * 本地处理 fetch_logs 工具（避免嵌套调用）
    */
   async handleFetchLogsLocally(args, requestId = null) {
-    const { nodes = [], keyword = '', keywords = [], last_hours = 2, log_level = 'INFO', context_lines = 0 } = args;
+    const { nodes = [], keyword = '', keywords = [], last_hours = 2, log_level = 'INFO', context_lines = 0, ssh_user, ssh_key_path } = args;
 
     // 支持单个 keyword 或多个 keywords 数组
     const keywordList = keywords.length > 0 ? keywords : (keyword ? [keyword] : []);
 
+    // SSH 配置 - 传递给 executeSshCommands
+    const sshConfig = { ssh_user, ssh_key_path };
+
     console.error(`      📋 Local fetch_logs: ${nodes.length} nodes, keywords=${JSON.stringify(keywordList)}`);
+    console.error(`      📋 SSH config: user=${ssh_user}, key_path=${ssh_key_path || '(default)'}`);
     console.error(`      📋 fetch_logs args: ${JSON.stringify(args, null, 2)}`);
 
     // 阶段1：发现日志路径
@@ -975,7 +979,7 @@ class ThinMCPServer {
       };
     });
 
-    const pathResults = await this.executeSshCommands(discoverCommands, {}, requestId);
+    const pathResults = await this.executeSshCommands(discoverCommands, sshConfig, requestId);
     console.error(`         ✅ Discovered ${pathResults.ssh_summary.successful} paths`);
 
     // 阶段2：拉取日志
@@ -987,7 +991,9 @@ class ThinMCPServer {
 
       const logDir = result.output.trim();
       const nodeType = result.node_type;
-      const logFile = nodeType === 'fe' ? 'fe.log*' : nodeType === 'cn' ? 'cn.log*' : 'be.log*';
+      // CN/BE 日志文件名格式: cn.INFO.log.*, cn.WARNING.log.*, be.INFO.log.* 等
+      // FE 日志文件名格式: fe.log*
+      const logFile = nodeType === 'fe' ? 'fe.log*' : nodeType === 'cn' ? 'cn.*.log*' : 'be.*.log*';
 
       // 构建日志拉取命令
       // 使用更大的 mtime 范围以确保能找到所有轮转的日志文件
@@ -1002,12 +1008,10 @@ class ThinMCPServer {
       console.error(`         📂 mtime days: ${mtimeDays}, last_hours: ${last_hours}`);
 
       if (keywordList.length > 0) {
-        // 多个关键词用多个 grep 命令链起来
-        // 例如: find ... | xargs grep -ah "finish transaction" | grep "59886"
-        fetchCmd += ` | xargs grep -ah "${keywordList[0]}"`;  // -h 去掉文件名前缀, -a 强制处理二进制文件
-        for (let i = 1; i < keywordList.length; i++) {
-          fetchCmd += ` | grep "${keywordList[i]}"`;
-        }
+        // 使用 OR 逻辑搜索任意一个关键词（使用 grep -E 正则）
+        // 例如: find ... | xargs grep -ahE "keyword1|keyword2"
+        const grepPattern = keywordList.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+        fetchCmd += ` | xargs grep -ahE "${grepPattern}"`;  // -h 去掉文件名前缀, -a 强制处理二进制文件, -E 扩展正则
         if (context_lines > 0) {
           fetchCmd += ` -A ${context_lines} -B ${context_lines}`;
         }
@@ -1024,7 +1028,7 @@ class ThinMCPServer {
       });
     }
 
-    const logResults = await this.executeSshCommands(fetchCommands, {}, requestId);
+    const logResults = await this.executeSshCommands(fetchCommands, sshConfig, requestId);
     console.error(`         ✅ Fetched logs from ${logResults.ssh_summary.successful} nodes`);
 
     // 构建返回结果
@@ -1035,10 +1039,14 @@ class ThinMCPServer {
       lines: result.output ? result.output.split('\n').length : 0,
     }));
 
+    // 为每个节点的日志添加来源标记
     const allRawContents = logResults.ssh_results
-      .filter(r => r.success && r.output)
-      .map(r => r.output);
-    const rawContent = allRawContents.join('\n');
+      .filter(r => r.success && r.output && r.output.trim())
+      .map(r => {
+        const nodeLabel = `===== [${r.node_type.toUpperCase()} ${r.node_ip}] =====`;
+        return `${nodeLabel}\n${r.output.trim()}`;
+      });
+    const rawContent = allRawContents.join('\n\n');
 
     return {
       status: 'completed',
@@ -3436,10 +3444,12 @@ class ThinMCPServer {
 
         // 优先使用传入的 session_id，否则自动查找
         let lastCompletedStep = 0;
+        let restoredArgs = null;  // 用于存储恢复的 args
         if (processedArgs.session_id) {
           const sessionData = this.getSession(processedArgs.session_id);
           if (sessionData) {
             restoredResults = sessionData.results || {};
+            restoredArgs = sessionData.args || {};  // 恢复保存的 args
             activeSessionId = processedArgs.session_id;
             lastCompletedStep = sessionData.lastCompletedStep || 0;
             console.error(`   🔄 通过 session_id 恢复了 ${Object.keys(restoredResults).length} 个中间结果字段, lastCompletedStep=${lastCompletedStep}`);
@@ -3449,11 +3459,22 @@ class ThinMCPServer {
           const activeSession = this.findActiveSessionByKey(sessionKey);
           if (activeSession) {
             restoredResults = activeSession.data.results || {};
+            restoredArgs = activeSession.data.args || {};  // 恢复保存的 args
             activeSessionId = activeSession.sessionId;
             lastCompletedStep = activeSession.data.lastCompletedStep || 0;
             console.error(`   🔄 自动恢复了 ${Object.keys(restoredResults).length} 个中间结果字段, lastCompletedStep=${lastCompletedStep}`);
           } else {
             console.error(`   [DEBUG] 首次调用，创建新会话`);
+          }
+        }
+
+        // 从保存的 args 恢复参数（如果当前请求没有提供）
+        if (restoredArgs) {
+          for (const key of Object.keys(restoredArgs)) {
+            if (restoredArgs[key] !== undefined && processedArgs[key] === undefined) {
+              processedArgs[key] = restoredArgs[key];
+              console.error(`   📦 从 args 恢复: ${key}`);
+            }
           }
         }
 
@@ -4079,6 +4100,14 @@ class ThinMCPServer {
           console.error(`   [DEBUG] - step: ${analysis.step}, total_steps: ${analysis.total_steps}`);
           console.error(`   [DEBUG] - step_name: ${analysis.step_name}`);
           console.error(`   [DEBUG] - phase: ${analysis.phase}`);
+          console.error(`   [DEBUG] - completed_step: ${JSON.stringify(analysis.completed_step)}`);
+
+          // 检测到步骤完成时，主动退出循环以便向用户显示进度
+          // 这样用户可以看到每个步骤的完成状态，而不是所有步骤在循环中被"吞掉"
+          if (analysis.completed_step?.step > 0 && analysis.status === 'needs_more_queries') {
+            console.error(`   [DEBUG] 检测到步骤 ${analysis.completed_step.step} 完成，退出循环以显示进度`);
+            break;
+          }
         }
 
         console.error(`   [DEBUG] ========== Exited while loop ==========`);
@@ -4215,7 +4244,8 @@ class ThinMCPServer {
             console.error(`   💾 Session ${sessionId} 已存储 (步骤 ${completedStep} 完成)`);
 
             // 返回步骤完成报告
-            const stepReport = `✅ 步骤 ${completedStep}/? 完成\n\n💡 继续调用此工具执行下一步骤`;
+            const totalSteps = analysis.total_steps || analysis._intermediate?.total_steps || '?';
+            const stepReport = `✅ 步骤 ${completedStep}/${totalSteps} 完成`;
             return {
               content: [{ type: 'text', text: stepReport }],
               _raw: analysis,
