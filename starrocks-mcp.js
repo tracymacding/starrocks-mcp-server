@@ -4195,29 +4195,40 @@ class ThinMCPServer {
         if (analysis.status === 'needs_more_queries' && analysis._intermediate) {
           console.error(`\n   📦 检测到中间结果，保存会话以便继续执行`);
 
-          // 检查是否有 completed_step 信息（表示某个步骤已完成）
-          const completedStep = analysis.completed_step?.step || analysis._intermediate?.completed_step || 0;
-          if (completedStep > 0) {
-            const sessionId = activeSessionId || this.generateSessionId(toolName);
-            // 注意：_intermediate 需要合并而不是覆盖，以保留之前步骤的数据
-            const sessionData = {
-              sessionKey,
-              results: {
-                ...results,
-                _intermediate: {
-                  ...(results._intermediate || {}),  // 保留之前步骤的中间结果
-                  ...analysis._intermediate,          // 合并当前步骤的中间结果
-                },
+          const sessionId = activeSessionId || this.generateSessionId(toolName);
+          // 注意：_intermediate 需要合并而不是覆盖，以保留之前步骤的数据
+          const sessionData = {
+            sessionKey,
+            results: {
+              ...results,
+              _intermediate: {
+                ...(results._intermediate || {}),  // 保留之前步骤的中间结果
+                ...analysis._intermediate,          // 合并当前步骤的中间结果
               },
-              args: processedArgs,
-              lastCompletedStep: completedStep,
-            };
-            this.storeSession(sessionId, sessionData);
-            console.error(`   💾 Session ${sessionId} 已存储 (步骤 ${completedStep} 完成)`);
+            },
+            args: processedArgs,
+            lastCompletedStep: analysis.completed_step?.step || analysis.step || 0,
+          };
+          this.storeSession(sessionId, sessionData);
 
+          // 检查是否有 completed_step 信息（表示某个步骤已完成）
+          const completedStep = analysis.completed_step?.step || 0;
+          if (completedStep > 0) {
+            console.error(`   💾 Session ${sessionId} 已存储 (步骤 ${completedStep} 完成)`);
             // 返回步骤完成报告
             const totalSteps = analysis.total_steps || analysis._intermediate?.total_steps || '?';
             const stepReport = `✅ 步骤 ${completedStep}/${totalSteps} 完成`;
+            return {
+              content: [{ type: 'text', text: stepReport }],
+              _raw: analysis,
+            };
+          } else {
+            // 中间阶段（没有 completed_step），也需要保存会话并返回让 Claude 继续
+            console.error(`   💾 Session ${sessionId} 已存储 (中间阶段: ${analysis.phase})`);
+            const currentStep = analysis.step || '?';
+            const totalSteps = analysis.total_steps || '?';
+            const stepName = analysis.step_name || analysis.phase || '执行中';
+            const stepReport = `⏳ 步骤 ${currentStep}/${totalSteps}: ${stepName}\n\n${analysis.message || '请继续执行下一阶段'}`;
             return {
               content: [{ type: 'text', text: stepReport }],
               _raw: analysis,
