@@ -39,3 +39,7 @@ ecosystem.config.js
 
 # Claude Code local config
 .claude/
+
+# Local MCP configuration
+.mcp.json
+run-mcp.sh
