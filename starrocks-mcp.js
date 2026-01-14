@@ -1627,15 +1627,39 @@ class ThinMCPServer {
               `   Executing CLI: ${cmd.command.substring(0, 80)}...`,
             );
 
-            const { stdout } = await execAsync(cmd.command, {
+            // 🔍 调试日志：记录完整命令
+            if (cmdType === 'list_data') {
+              console.error(`   🔍 [DEBUG] list_data 完整命令: ${cmd.command}`);
+              console.error(`   🔍 [DEBUG] 命令长度: ${cmd.command.length}`);
+            }
+
+            const { stdout, stderr } = await execAsync(cmd.command, {
               timeout: commandTimeoutMs,
               maxBuffer: 10 * 1024 * 1024, // 10MB
             });
 
             const duration = Date.now() - cmdStartTime;
 
+            // 🔍 调试日志：记录执行结果
+            if (cmdType === 'list_data') {
+              console.error(`   🔍 [DEBUG] list_data 执行完成`);
+              console.error(`   🔍 [DEBUG] 耗时: ${duration}ms`);
+              console.error(`   🔍 [DEBUG] stdout 长度: ${stdout.length}`);
+              console.error(`   🔍 [DEBUG] stderr 长度: ${stderr?.length || 0}`);
+              console.error(`   🔍 [DEBUG] stdout 前500字符: ${stdout.substring(0, 500)}`);
+              if (stderr) {
+                console.error(`   🔍 [DEBUG] stderr: ${stderr}`);
+              }
+            }
+
+            // 需要返回原始输出的命令类型
+            const rawOutputTypes = new Set([
+              'ossutil_ls', 'aws_s3_ls',                   // 列目录
+              'download_meta', 'parse_meta', 'list_data', 'cleanup',  // 垃圾文件检测相关
+            ]);
+
             // 根据命令类型返回不同格式的结果
-            if (cmdType === 'ossutil_ls' || cmdType === 'aws_s3_ls') {
+            if (rawOutputTypes.has(cmdType)) {
               // 记录成功结果
               if (requestId) {
                 this.logger.logCliResult(requestId, cmd.command, true, stdout, null, duration, {
@@ -1643,10 +1667,13 @@ class ThinMCPServer {
                   key: cmdKey,
                 });
               }
-              // 列目录命令：返回原始输出
+              // 返回原始输出
               return {
+                id: cmd.id,
                 table_key: cmd.table_key,
                 table_path: cmd.table_path,
+                partition_id: cmd.partition_id,
+                partition_name: cmd.partition_name,
                 storage_type: cmd.storage_type,
                 type: cmdType,
                 success: true,
@@ -1709,10 +1736,19 @@ class ThinMCPServer {
               });
             }
 
-            if (cmdType === 'ossutil_ls' || cmdType === 'aws_s3_ls') {
+            // 需要返回原始输出格式的命令类型
+            const rawOutputTypesErr = new Set([
+              'ossutil_ls', 'aws_s3_ls',
+              'download_meta', 'parse_meta', 'list_data', 'cleanup',
+            ]);
+
+            if (rawOutputTypesErr.has(cmdType)) {
               return {
+                id: cmd.id,
                 table_key: cmd.table_key,
                 table_path: cmd.table_path,
+                partition_id: cmd.partition_id,
+                partition_name: cmd.partition_name,
                 storage_type: cmd.storage_type,
                 type: cmdType,
                 success: false,
@@ -3648,7 +3684,7 @@ class ThinMCPServer {
 
         // 3.5 处理多阶段查询（如存储放大分析的 schema 检测）
         let phaseCount = 1;
-        const maxPhases = 10; // 防止无限循环（需要支持 6+ 阶段的 analyze_slow_load_job）
+        const maxPhases = 50; // 防止无限循环（需要支持多分区 garbage file 检测：7分区 × 4阶段 = 28）
 
         console.error(`   [DEBUG] Initial analysis result:`);
         console.error(`   [DEBUG] - status: ${analysis.status}`);
@@ -3718,6 +3754,9 @@ class ThinMCPServer {
           phaseCount++;
           console.error(`   [DEBUG] ========== Entered while loop, phaseCount=${phaseCount} ==========`);
 
+          // 🔍 调试：在循环开始时记录当前分析状态
+          fs.appendFileSync('/tmp/mcp_debug.log', `${new Date().toISOString()} WHILE_LOOP_START: phaseCount=${phaseCount}, phase=${analysis.phase}, requires_cli=${analysis.requires_cli_execution}, cli_count=${analysis.cli_commands?.length || 0}, cli_key=${analysis.cli_result_key || '-'}\n`);
+
           // 优先使用步骤级别的进度信息（用于细粒度进度通知）
           if (analysis.step && analysis.total_steps) {
             // 步骤级别的进度通知
@@ -3749,16 +3788,54 @@ class ThinMCPServer {
             console.error(
               `   Executing ${analysis.cli_commands.length} CLI commands...`,
             );
+
+            // 🔍 调试：写入文件
+            const debugLog = (msg) => {
+              fs.appendFileSync('/tmp/mcp_debug.log', `${new Date().toISOString()} ${msg}\n`);
+            };
+
+            for (const cmd of analysis.cli_commands) {
+              debugLog(`CLI command: id=${cmd.id}, type=${cmd.type}, partition=${cmd.partition_name || cmd.partition_id || '-'}`);
+            }
+
             const cliResults = await this.executeCliCommands(
               analysis.cli_commands,
               requestId,
             );
 
+            debugLog(`CLI execution done, results count: ${cliResults.cli_results?.length || 0}`);
+            for (const r of (cliResults.cli_results || [])) {
+              debugLog(`CLI result: id=${r.id}, success=${r.success}, output_len=${r.output?.length || 0}`);
+            }
+
             // 使用 Central API 指定的结果键名，默认 cli_results/cli_summary
             const cliResultKey = analysis.cli_result_key || 'cli_results';
             const cliSummaryKey = analysis.cli_summary_key || 'cli_summary';
-            results[cliResultKey] = cliResults.cli_results;
-            results[cliSummaryKey] = cliResults.cli_summary;
+
+            debugLog(`Storing CLI results to key: ${cliResultKey}`);
+
+            // 如果使用默认 key 'cli_results'，追加结果而不是覆盖
+            // 如果使用自定义 key，则直接赋值（向后兼容）
+            if (cliResultKey === 'cli_results') {
+              // 追加到现有结果
+              if (!Array.isArray(results[cliResultKey])) {
+                results[cliResultKey] = [];
+              }
+              results[cliResultKey].push(...cliResults.cli_results);
+
+              // 合并 summary
+              if (!results[cliSummaryKey]) {
+                results[cliSummaryKey] = { total: 0, successful: 0, failed: 0, execution_time_ms: 0 };
+              }
+              results[cliSummaryKey].total += cliResults.cli_summary.total;
+              results[cliSummaryKey].successful += cliResults.cli_summary.successful;
+              results[cliSummaryKey].failed += cliResults.cli_summary.failed;
+              results[cliSummaryKey].execution_time_ms += cliResults.cli_summary.execution_time_ms;
+            } else {
+              // 自定义 key，直接赋值（向后兼容旧行为）
+              results[cliResultKey] = cliResults.cli_results;
+              results[cliSummaryKey] = cliResults.cli_summary;
+            }
             console.error(
               `   CLI completed: ${cliResults.cli_summary.successful} success, ${cliResults.cli_summary.failed} failed -> ${cliResultKey}`,
             );
@@ -4025,6 +4102,12 @@ class ThinMCPServer {
           if (analysis._intermediate) {
             results._intermediate = analysis._intermediate;
             console.error(`   [DEBUG] 保存 _intermediate 到 results，keys: ${Object.keys(analysis._intermediate).join(', ')}`);
+            // 🔍 调试：记录关键的分区处理状态
+            const partIdx = analysis._intermediate._garbage_files_partition_index;
+            const metaDownloaded = analysis._intermediate._current_partition_meta_downloaded;
+            const metaParsed = analysis._intermediate._current_partition_meta_parsed;
+            const dataListed = analysis._intermediate._current_partition_data_listed;
+            fs.appendFileSync('/tmp/mcp_debug.log', `${new Date().toISOString()} INTERMEDIATE: partition_idx=${partIdx}, meta_downloaded=${metaDownloaded}, meta_parsed=${metaParsed}, data_listed=${dataListed}\n`);
           }
 
           // 执行下一阶段的 SQL 查询
@@ -4073,6 +4156,12 @@ class ThinMCPServer {
           console.error(`   [DEBUG] - step_name: ${analysis.step_name}`);
           console.error(`   [DEBUG] - phase: ${analysis.phase}`);
           console.error(`   [DEBUG] - completed_step: ${JSON.stringify(analysis.completed_step)}`);
+          console.error(`   [DEBUG] - requires_cli_execution: ${analysis.requires_cli_execution}`);
+          console.error(`   [DEBUG] - cli_commands count: ${analysis.cli_commands?.length || 0}`);
+          console.error(`   [DEBUG] - cli_result_key: ${analysis.cli_result_key || '-'}`);
+
+          // 🔍 调试：写入文件
+          fs.appendFileSync('/tmp/mcp_debug.log', `${new Date().toISOString()} Re-analysis: phase=${analysis.phase}, requires_cli=${analysis.requires_cli_execution}, cli_commands=${analysis.cli_commands?.length || 0}, cli_result_key=${analysis.cli_result_key || '-'}\n`);
 
           // 检测到步骤完成时，主动退出循环以便向用户显示进度
           // 这样用户可以看到每个步骤的完成状态，而不是所有步骤在循环中被"吞掉"
@@ -4207,7 +4296,7 @@ class ThinMCPServer {
               },
             },
             args: processedArgs,
-            lastCompletedStep: analysis.completed_step?.step || analysis.step || 0,
+            lastCompletedStep: analysis.completed_step?.step || 0,  // 只有明确的 completed_step 才算完成
           };
           this.storeSession(sessionId, sessionData);
 
