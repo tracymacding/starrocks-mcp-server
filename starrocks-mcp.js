@@ -4253,9 +4253,11 @@ class ThinMCPServer {
             },
             args: processedArgs,
             lastCompletedStep: analysis.completed_step?.step || 0,  // 记录已完成步骤
+            // 存储 Central API 返回的下一步骤号（内部步骤号，用于正确恢复）
+            nextContinueFromStep: analysis.next_args?.continue_from_step,
           };
           this.storeSession(sessionId, sessionData);
-          console.error(`   💾 Session ${sessionId} 已存储 (key: ${sessionKey})`);
+          console.error(`   💾 Session ${sessionId} 已存储 (key: ${sessionKey}, nextContinueFromStep: ${analysis.next_args?.continue_from_step})`);
 
           const stepReport = this.formatStepCompletedReport(analysis, sessionId);
           return {
@@ -4305,6 +4307,8 @@ class ThinMCPServer {
             },
             args: processedArgs,
             lastCompletedStep: analysis.completed_step?.step || 0,  // 只有明确的 completed_step 才算完成
+            // 存储 Central API 返回的下一步骤号（内部步骤号，用于正确恢复）
+            nextContinueFromStep: analysis.next_args?.continue_from_step,
           };
           this.storeSession(sessionId, sessionData);
 
