@@ -3477,6 +3477,7 @@ class ThinMCPServer {
 
         // 优先使用传入的 session_id，否则自动查找
         let lastCompletedStep = 0;
+        let nextContinueFromStep = null;  // 存储 Central API 返回的下一步骤号（内部步骤号）
         let restoredArgs = null;  // 用于存储恢复的 args
         if (processedArgs.session_id) {
           const sessionData = this.getSession(processedArgs.session_id);
@@ -3485,7 +3486,8 @@ class ThinMCPServer {
             restoredArgs = sessionData.args || {};  // 恢复保存的 args
             activeSessionId = processedArgs.session_id;
             lastCompletedStep = sessionData.lastCompletedStep || 0;
-            console.error(`   🔄 通过 session_id 恢复了 ${Object.keys(restoredResults).length} 个中间结果字段, lastCompletedStep=${lastCompletedStep}`);
+            nextContinueFromStep = sessionData.nextContinueFromStep;  // 恢复内部步骤号
+            console.error(`   🔄 通过 session_id 恢复了 ${Object.keys(restoredResults).length} 个中间结果字段, lastCompletedStep=${lastCompletedStep}, nextContinueFromStep=${nextContinueFromStep}`);
           }
         } else {
           // 自动查找匹配的活跃会话
@@ -3495,7 +3497,8 @@ class ThinMCPServer {
             restoredArgs = activeSession.data.args || {};  // 恢复保存的 args
             activeSessionId = activeSession.sessionId;
             lastCompletedStep = activeSession.data.lastCompletedStep || 0;
-            console.error(`   🔄 自动恢复了 ${Object.keys(restoredResults).length} 个中间结果字段, lastCompletedStep=${lastCompletedStep}`);
+            nextContinueFromStep = activeSession.data.nextContinueFromStep;  // 恢复内部步骤号
+            console.error(`   🔄 自动恢复了 ${Object.keys(restoredResults).length} 个中间结果字段, lastCompletedStep=${lastCompletedStep}, nextContinueFromStep=${nextContinueFromStep}`);
           } else {
             console.error(`   [DEBUG] 首次调用，创建新会话`);
           }
@@ -3512,9 +3515,12 @@ class ThinMCPServer {
         }
 
         // 如果有已完成的步骤，设置 continue_from_step 参数告诉 API 从下一步继续
+        // 优先使用 Central API 返回的 nextContinueFromStep（内部步骤号），确保步骤映射正确
         if (lastCompletedStep > 0) {
-          processedArgs.continue_from_step = lastCompletedStep + 1;
-          console.error(`   📍 设置 continue_from_step=${processedArgs.continue_from_step} (上次完成步骤 ${lastCompletedStep})`);
+          // nextContinueFromStep 是 Central API 返回的内部步骤号，考虑了步骤跳过的情况
+          // 例如：当 detect_garbage_files=false 时，显示步骤 4 完成后，内部步骤应该是 6（跳过了内部步骤 4）
+          processedArgs.continue_from_step = nextContinueFromStep || (lastCompletedStep + 1);
+          console.error(`   📍 设置 continue_from_step=${processedArgs.continue_from_step} (nextContinueFromStep=${nextContinueFromStep}, 显示步骤 ${lastCompletedStep})`);
 
           // 将恢复的中间结果合并到 processedArgs 中（API 端从 args 中读取这些值）
           // 动态恢复所有中间结果键，支持不同工具的不同键名
@@ -3712,6 +3718,8 @@ class ThinMCPServer {
             },
             args: processedArgs,
             lastCompletedStep: analysis.completed_step?.step || 0,
+            // 存储 Central API 返回的下一步骤号（内部步骤号，用于正确恢复）
+            nextContinueFromStep: analysis.next_args?.continue_from_step,
           };
           this.storeSession(sessionId, sessionData);
           console.error(`   💾 Session ${sessionId} 已存储 (key: ${sessionKey})`);
