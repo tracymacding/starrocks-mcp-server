@@ -2949,12 +2949,14 @@ class ThinMCPServer {
    * @param {Object} analysis - 分析结果
    * @param {string} reportPath - 报告文件路径（可选）
    */
-  generateBriefSummary(analysis, reportPath = null) {
+  generateBriefSummary(analysis, reportPath = null, toolName = null) {
     if (!analysis || typeof analysis !== 'object') {
       return '❌ 分析结果格式错误';
     }
 
     const { tool, status, summary, expert } = analysis;
+    // 优先使用 analysis 中的 tool，其次使用传入的 toolName
+    const actualTool = tool || toolName;
 
     // 构建简短摘要
     let briefSummary = '✅ 分析完成\n\n';
@@ -3020,8 +3022,8 @@ class ThinMCPServer {
       briefSummary += `- ${analysis.diagnosis_results.summary || '分析完成'}\n`;
       briefSummary += `- 发现问题: ${analysis.diagnosis_results.total_issues || 0} 个\n`;
     } else {
-      briefSummary += `工具: ${tool || expert || '未知'}\n`;
-      briefSummary += `状态: ${status || '未知'}\n`;
+      briefSummary += `工具: ${actualTool || expert || '未知'}\n`;
+      briefSummary += `状态: ${status || '完成'}\n`;
     }
 
     // 显示报告文件路径
@@ -4315,10 +4317,13 @@ class ThinMCPServer {
           // 检查是否有 completed_step 信息（表示某个步骤已完成）
           const completedStep = analysis.completed_step?.step || 0;
           if (completedStep > 0) {
-            console.error(`   💾 Session ${sessionId} 已存储 (步骤 ${completedStep} 完成)`);
+            const stepName = analysis.completed_step?.name || '';
+            console.error(`   💾 Session ${sessionId} 已存储 (步骤 ${completedStep} 完成${stepName ? ': ' + stepName : ''})`);
             // 返回步骤完成报告
             const totalSteps = analysis.total_steps || analysis._intermediate?.total_steps || '?';
-            const stepReport = `✅ 步骤 ${completedStep}/${totalSteps} 完成`;
+            const stepReport = stepName
+              ? `✅ 步骤 ${completedStep}/${totalSteps} 完成: ${stepName}`
+              : `✅ 步骤 ${completedStep}/${totalSteps} 完成`;
             return {
               content: [{ type: 'text', text: stepReport }],
               _raw: analysis,
@@ -4399,7 +4404,7 @@ class ThinMCPServer {
         }
 
         // 生成简短摘要
-        const summary = this.generateBriefSummary(analysis, reportPath);
+        const summary = this.generateBriefSummary(analysis, reportPath, toolName);
 
         // 分析完成后清除会话，确保下次调用是全新分析
         if (activeSessionId) {
