@@ -1595,201 +1595,232 @@ class ThinMCPServer {
         total: commands.length,
         successful: 0,
         failed: 0,
+        retried: 0,
         execution_time_ms: 0,
       },
     };
 
     const startTime = Date.now();
-    const maxConcurrency = 10;
-    const commandTimeoutMs = 30000; // 30 秒超时
+    const maxConcurrency = 50;       // 降低并发数
+    const commandTimeoutMs = 180000; // 180 秒超时（大表 shard 路径需要更长时间）
+    const maxRetries = 3;            // 最大重试次数
+    const retryDelayMs = 1000;       // 重试间隔
 
-    // 分批并发执行
-    for (let i = 0; i < commands.length; i += maxConcurrency) {
-      const batch = commands.slice(i, i + maxConcurrency);
+    // 需要返回原始输出的命令类型
+    const rawOutputTypes = new Set([
+      'ossutil_ls', 'aws_s3_ls',
+      'download_meta', 'parse_meta', 'list_data', 'cleanup',
+    ]);
 
-      const batchResults = await Promise.all(
-        batch.map(async (cmd) => {
-          const cmdType = cmd.type || '';
-          const cmdKey = cmd.partition_key || cmd.table_key || cmd.path;
+    // 单个命令执行函数（带重试）
+    const executeOneCommand = async (cmd, cmdIndex) => {
+      const cmdType = cmd.type || '';
+      const cmdKey = cmd.partition_key || cmd.table_key || cmd.path;
 
-          // 记录 CLI 命令到日志
-          if (requestId) {
-            this.logger.logCliCommand(requestId, cmd.command, {
-              type: cmdType,
-              key: cmdKey,
-              storageType: cmd.storage_type,
-            });
+      // 记录 CLI 命令到日志
+      if (requestId) {
+        this.logger.logCliCommand(requestId, cmd.command, {
+          type: cmdType,
+          key: cmdKey,
+          storageType: cmd.storage_type,
+        });
+      }
+
+      let lastError = null;
+      let totalDuration = 0;
+
+      // 重试循环
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const cmdStartTime = Date.now();
+        try {
+          if (attempt === 1) {
+            console.error(`   [${cmdIndex + 1}/${commands.length}] Executing: ${cmd.command.substring(0, 60)}...`);
+          } else {
+            console.error(`   [${cmdIndex + 1}/${commands.length}] Retry ${attempt}/${maxRetries}: ${cmd.command.substring(0, 60)}...`);
+            results.cli_summary.retried++;
           }
 
-          const cmdStartTime = Date.now();
-          try {
-            console.error(
-              `   Executing CLI: ${cmd.command.substring(0, 80)}...`,
-            );
+          const { stdout, stderr } = await execAsync(cmd.command, {
+            timeout: commandTimeoutMs,
+            maxBuffer: 10 * 1024 * 1024, // 10MB
+          });
 
-            // 🔍 调试日志：记录完整命令
-            if (cmdType === 'list_data') {
-              console.error(`   🔍 [DEBUG] list_data 完整命令: ${cmd.command}`);
-              console.error(`   🔍 [DEBUG] 命令长度: ${cmd.command.length}`);
-            }
+          const duration = Date.now() - cmdStartTime;
+          totalDuration += duration;
 
-            const { stdout, stderr } = await execAsync(cmd.command, {
-              timeout: commandTimeoutMs,
-              maxBuffer: 10 * 1024 * 1024, // 10MB
-            });
-
-            const duration = Date.now() - cmdStartTime;
-
-            // 🔍 调试日志：记录执行结果
-            if (cmdType === 'list_data') {
-              console.error(`   🔍 [DEBUG] list_data 执行完成`);
-              console.error(`   🔍 [DEBUG] 耗时: ${duration}ms`);
-              console.error(`   🔍 [DEBUG] stdout 长度: ${stdout.length}`);
-              console.error(`   🔍 [DEBUG] stderr 长度: ${stderr?.length || 0}`);
-              console.error(`   🔍 [DEBUG] stdout 前500字符: ${stdout.substring(0, 500)}`);
-              if (stderr) {
-                console.error(`   🔍 [DEBUG] stderr: ${stderr}`);
-              }
-            }
-
-            // 需要返回原始输出的命令类型
-            const rawOutputTypes = new Set([
-              'ossutil_ls', 'aws_s3_ls',                   // 列目录
-              'download_meta', 'parse_meta', 'list_data', 'cleanup',  // 垃圾文件检测相关
-            ]);
-
-            // 根据命令类型返回不同格式的结果
-            if (rawOutputTypes.has(cmdType)) {
-              // 记录成功结果
-              if (requestId) {
-                this.logger.logCliResult(requestId, cmd.command, true, stdout, null, duration, {
-                  type: cmdType,
-                  key: cmdKey,
-                });
-              }
-              // 返回原始输出
-              return {
-                id: cmd.id,
-                table_key: cmd.table_key,
-                table_path: cmd.table_path,
-                partition_id: cmd.partition_id,
-                partition_name: cmd.partition_name,
-                storage_type: cmd.storage_type,
-                type: cmdType,
-                success: true,
-                output: stdout,
-                execution_time_ms: duration,
-              };
-            } else if (cmdType === 'get_size') {
-              // 记录成功结果
-              if (requestId) {
-                this.logger.logCliResult(requestId, cmd.command, true, stdout.trim(), null, duration, {
-                  type: cmdType,
-                  key: cmdKey,
-                });
-              }
-              // 获取大小命令：返回原始输出供 expert 解析
-              return {
-                table_key: cmd.table_key,
-                partition_id: cmd.partition_id,
-                path: cmd.path,
-                storage_type: cmd.storage_type,
-                subdir: cmd.subdir || null,  // 保留子目录信息
-                success: true,
-                output: stdout.trim(),
-                execution_time_ms: duration,
-              };
-            } else {
-              // 存储空间查询命令（默认）：解析大小
-              const sizeBytes = this.parseStorageCliOutput(
-                cmd.storage_type || cmd.actual_storage_type,
-                stdout,
-              );
-              // 记录成功结果
-              if (requestId) {
-                this.logger.logCliResult(requestId, cmd.command, sizeBytes !== null, stdout, null, duration, {
-                  type: cmdType,
-                  key: cmdKey,
-                  sizeBytes,
-                });
-              }
-              return {
-                partition_key: cmd.partition_key,
-                path: cmd.path,
-                storage_type: cmd.storage_type,
-                success: sizeBytes !== null,
-                size_bytes: sizeBytes,
-                execution_time_ms: duration,
-              };
-            }
-          } catch (error) {
-            const duration = Date.now() - cmdStartTime;
-            console.error(
-              `   CLI failed for ${cmdKey}: ${error.message}`,
-            );
-
-            // 记录失败结果
+          // 根据命令类型返回不同格式的结果
+          if (rawOutputTypes.has(cmdType)) {
             if (requestId) {
-              this.logger.logCliResult(requestId, cmd.command, false, null, error.message, duration, {
+              this.logger.logCliResult(requestId, cmd.command, true, stdout, null, duration, {
                 type: cmdType,
                 key: cmdKey,
               });
             }
-
-            // 需要返回原始输出格式的命令类型
-            const rawOutputTypesErr = new Set([
-              'ossutil_ls', 'aws_s3_ls',
-              'download_meta', 'parse_meta', 'list_data', 'cleanup',
-            ]);
-
-            if (rawOutputTypesErr.has(cmdType)) {
-              return {
-                id: cmd.id,
-                table_key: cmd.table_key,
-                table_path: cmd.table_path,
-                partition_id: cmd.partition_id,
-                partition_name: cmd.partition_name,
-                storage_type: cmd.storage_type,
+            return {
+              id: cmd.id,
+              table_key: cmd.table_key,
+              table_path: cmd.table_path,
+              partition_id: cmd.partition_id,
+              partition_name: cmd.partition_name,
+              storage_type: cmd.storage_type,
+              type: cmdType,
+              success: true,
+              output: stdout,
+              execution_time_ms: totalDuration,
+              attempts: attempt,
+            };
+          } else if (cmdType === 'get_size') {
+            if (requestId) {
+              this.logger.logCliResult(requestId, cmd.command, true, stdout.trim(), null, duration, {
                 type: cmdType,
-                success: false,
-                error: error.message,
-              };
-            } else if (cmdType === 'get_size') {
-              return {
-                table_key: cmd.table_key,
-                partition_id: cmd.partition_id,
-                path: cmd.path,
-                storage_type: cmd.storage_type,
-                subdir: cmd.subdir || null,  // 保留子目录信息
-                success: false,
-                error: error.message,
-              };
-            } else {
-              return {
-                partition_key: cmd.partition_key,
-                path: cmd.path,
-                storage_type: cmd.storage_type,
-                success: false,
-                error: error.message,
-              };
+                key: cmdKey,
+              });
             }
+            return {
+              table_key: cmd.table_key,
+              partition_id: cmd.partition_id,
+              path: cmd.path,
+              storage_type: cmd.storage_type,
+              subdir: cmd.subdir || null,
+              success: true,
+              output: stdout.trim(),
+              execution_time_ms: totalDuration,
+              attempts: attempt,
+            };
+          } else {
+            const sizeBytes = this.parseStorageCliOutput(
+              cmd.storage_type || cmd.actual_storage_type,
+              stdout,
+            );
+            if (requestId) {
+              this.logger.logCliResult(requestId, cmd.command, sizeBytes !== null, stdout, null, duration, {
+                type: cmdType,
+                key: cmdKey,
+                sizeBytes,
+              });
+            }
+            return {
+              partition_key: cmd.partition_key,
+              path: cmd.path,
+              storage_type: cmd.storage_type,
+              success: sizeBytes !== null,
+              size_bytes: sizeBytes,
+              execution_time_ms: totalDuration,
+              attempts: attempt,
+            };
           }
-        }),
-      );
+        } catch (error) {
+          const duration = Date.now() - cmdStartTime;
+          totalDuration += duration;
+          lastError = error;
 
-      for (const result of batchResults) {
-        results.cli_results.push(result);
-        if (result.success) {
-          results.cli_summary.successful++;
-        } else {
-          results.cli_summary.failed++;
+          // 判断是否需要重试（超时或临时错误）
+          const isRetryable = error.killed || // 超时被杀
+            error.message.includes('Configuration file not available') ||
+            error.message.includes('ETIMEDOUT') ||
+            error.message.includes('ECONNRESET') ||
+            error.message.includes('socket hang up');
+
+          if (isRetryable && attempt < maxRetries) {
+            console.error(`   [${cmdIndex + 1}] Attempt ${attempt} failed (retryable): ${error.message.substring(0, 80)}`);
+            await new Promise(resolve => setTimeout(resolve, retryDelayMs * attempt)); // 递增延迟
+            continue;
+          }
+
+          // 不可重试或已达最大重试次数
+          break;
         }
+      }
+
+      // 所有重试都失败
+      console.error(`   [${cmdIndex + 1}] CLI failed after ${maxRetries} attempts: ${lastError.message.substring(0, 100)}`);
+
+      if (requestId) {
+        this.logger.logCliResult(requestId, cmd.command, false, null, lastError.message, totalDuration, {
+          type: cmdType,
+          key: cmdKey,
+          attempts: maxRetries,
+        });
+      }
+
+      if (rawOutputTypes.has(cmdType)) {
+        return {
+          id: cmd.id,
+          table_key: cmd.table_key,
+          table_path: cmd.table_path,
+          partition_id: cmd.partition_id,
+          partition_name: cmd.partition_name,
+          storage_type: cmd.storage_type,
+          type: cmdType,
+          success: false,
+          error: lastError.message,
+          attempts: maxRetries,
+        };
+      } else if (cmdType === 'get_size') {
+        return {
+          table_key: cmd.table_key,
+          partition_id: cmd.partition_id,
+          path: cmd.path,
+          storage_type: cmd.storage_type,
+          subdir: cmd.subdir || null,
+          success: false,
+          error: lastError.message,
+          attempts: maxRetries,
+        };
+      } else {
+        return {
+          partition_key: cmd.partition_key,
+          path: cmd.path,
+          storage_type: cmd.storage_type,
+          success: false,
+          error: lastError.message,
+          attempts: maxRetries,
+        };
+      }
+    };
+
+    // 并发池实现（滑动窗口模式）
+    const allResults = new Array(commands.length);
+    let nextIndex = 0;
+    let completedCount = 0;
+    const progressInterval = Math.max(1, Math.floor(commands.length / 20)); // 每 5% 打印一次进度
+
+    const worker = async () => {
+      while (true) {
+        const currentIndex = nextIndex++;
+        if (currentIndex >= commands.length) break;
+
+        const result = await executeOneCommand(commands[currentIndex], currentIndex);
+        allResults[currentIndex] = result;
+        completedCount++;
+
+        // 进度报告
+        if (completedCount % progressInterval === 0 || completedCount === commands.length) {
+          const percent = Math.round((completedCount / commands.length) * 100);
+          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+          console.error(`   Progress: ${completedCount}/${commands.length} (${percent}%) - ${elapsed}s elapsed`);
+        }
+      }
+    };
+
+    // 启动并发 workers
+    console.error(`   Starting CLI execution: ${commands.length} commands, concurrency=${maxConcurrency}, timeout=${commandTimeoutMs}ms, maxRetries=${maxRetries}`);
+    const workers = Array(Math.min(maxConcurrency, commands.length)).fill(null).map(() => worker());
+    await Promise.all(workers);
+
+    // 汇总结果
+    for (const result of allResults) {
+      results.cli_results.push(result);
+      if (result.success) {
+        results.cli_summary.successful++;
+      } else {
+        results.cli_summary.failed++;
       }
     }
 
     results.cli_summary.execution_time_ms = Date.now() - startTime;
     console.error(
-      `   CLI execution completed: ${results.cli_summary.successful} success, ${results.cli_summary.failed} failed`,
+      `   CLI execution completed: ${results.cli_summary.successful} success, ${results.cli_summary.failed} failed, ${results.cli_summary.retried} retries, ${(results.cli_summary.execution_time_ms / 1000).toFixed(1)}s total`,
     );
 
     return results;
@@ -3143,6 +3174,11 @@ class ThinMCPServer {
         analysis.recommendations.slice(0, 3).forEach((rec, index) => {
           formattedReport += `  ${index + 1}. [${rec.priority}] ${rec.title}\n`;
         });
+      }
+
+      // 跳过的表汇总（Top N 优化）
+      if (amp.skipped_tables && amp.skipped_tables.count > 0) {
+        formattedReport += `\nℹ️  其他 ${amp.skipped_tables.count} 张表（数据量 ${amp.skipped_tables.total_data_size_gb} GB）未进行对象存储扫描\n`;
       }
 
       formattedReport += '\n📋 详细数据请查看 JSON 输出部分';
