@@ -920,10 +920,17 @@ class ThinMCPServer {
    * 可能与实际 fe.log 目录不同（用户可能配置了不同的 GC 日志输出目录）
    */
   getDiscoverFeLogPathCommand(queryPort = null) {
+    // 优先用 ps aux 方式（不需要 root 权限，适用于 FE 进程以 root 运行的情况）
+    // 从 -Xlog:gc* 参数提取日志路径；如果不匹配则尝试 -Djava.security.policy 方式
+    const psAuxCmd = `ps aux | grep 'StarRocksFE' | grep -v grep | head -1`;
+    const extractXlog = `sed -n 's/.*-Xlog:gc\\*:\\([^:]*\\):.*/\\1/p' | xargs -I{} dirname {}`;
+    const extractPolicy = `sed -n 's/.*-Djava.security.policy=\\([^[:space:]]*\\).*/\\1/p' | sed 's|/conf/udf_security.policy|/log|'`;
+
     if (queryPort) {
-      return `lsof -i :${queryPort} -s TCP:LISTEN -t 2>/dev/null | head -1 | xargs -I{} ps -p {} -o args= 2>/dev/null | sed -n 's/.*-Djava.security.policy=\\([^[:space:]]*\\).*/\\1/p' | sed 's|/conf/udf_security.policy|/log|'`;
+      const lsofCmd = `lsof -i :${queryPort} -s TCP:LISTEN -t 2>/dev/null | head -1 | xargs -I{} ps -p {} -o args= 2>/dev/null`;
+      return `result=$(${lsofCmd} | ${extractXlog}); [ -n "$result" ] && echo "$result" || { result=$(${psAuxCmd} | ${extractXlog}); [ -n "$result" ] && echo "$result" || ${psAuxCmd} | ${extractPolicy}; }`;
     }
-    return `ps aux | grep 'StarRocksFE' | grep -v grep | head -1 | sed -n 's/.*-Djava.security.policy=\\([^[:space:]]*\\).*/\\1/p' | sed 's|/conf/udf_security.policy|/log|'`;
+    return `result=$(${psAuxCmd} | ${extractXlog}); [ -n "$result" ] && echo "$result" || ${psAuxCmd} | ${extractPolicy}`;
   }
 
   /**
