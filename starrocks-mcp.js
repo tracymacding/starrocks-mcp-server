@@ -3014,7 +3014,14 @@ class ThinMCPServer {
     const actualTool = tool || toolName;
 
     // 构建简短摘要
-    let briefSummary = '✅ 分析完成\n\n';
+    let briefSummary;
+    if (status === 'plan') {
+      briefSummary = `📋 执行计划已生成\n\n工具: ${actualTool}\n\n`;
+    } else if (status === 'error' || status === 'failed') {
+      briefSummary = `❌ 分析失败\n\n工具: ${actualTool}\n状态: ${status}\n\n`;
+    } else {
+      briefSummary = '✅ 分析完成\n\n';
+    }
 
     // 根据不同工具生成不同的摘要
     if (tool === 'analyze_slow_load_job' && summary) {
