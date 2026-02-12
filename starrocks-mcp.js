@@ -1432,6 +1432,16 @@ class ThinMCPServer {
             };
           }
         }
+      } catch (connError) {
+        // 数据库连接失败时，将所有 SQL 查询标记为错误，而不是直接抛异常
+        // 这样后续逻辑（如 get_query_profile）可以降级到 SSH 获取 fe.profile.log
+        console.error(`Database connection failed: ${connError.message}`);
+        for (const query of sqlQueries) {
+          results[query.id] = {
+            error: `Database connection failed: ${connError.message}`,
+            sql: query.sql ? query.sql.substring(0, 100) + '...' : 'N/A',
+          };
+        }
       } finally {
         if (connection) await connection.end();
       }
