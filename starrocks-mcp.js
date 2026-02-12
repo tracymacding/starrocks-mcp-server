@@ -989,6 +989,23 @@ class ThinMCPServer {
     const pathResults = await this.executeSshCommands(discoverCommands, sshConfig, requestId);
     console.error(`         ✅ Discovered ${pathResults.ssh_summary.successful} paths`);
 
+    // SSH 全部失败时提前返回，避免后续无意义的日志拉取
+    if (pathResults.ssh_summary.successful === 0) {
+      console.error(`         ⚠️ All SSH connections failed, skipping log fetch`);
+      return {
+        status: 'completed',
+        tool: 'fetch_logs',
+        ssh_failed: true,
+        nodes_analyzed: nodes.length,
+        log_sources: [],
+        log_analysis: { raw_content: '', total_lines: 0 },
+        summary: `SSH 连接失败，无法获取日志（共尝试 ${nodes.length} 个节点）`,
+        error_detail: pathResults.ssh_results
+          .filter(r => !r.success)
+          .map(r => ({ node_ip: r.node_ip, error: r.stderr || r.error })),
+      };
+    }
+
     // 阶段2：拉取日志
     console.error(`         Step 2: Fetching logs...`);
     const fetchCommands = [];
@@ -4473,11 +4490,47 @@ class ThinMCPServer {
       } catch (error) {
         console.error('Tool execution error:', error);
 
+        // 根据错误信息分类，提供更精确的诊断
+        const errMsg = error.message || String(error);
+        let diagnosis = '';
+        let failedStep = '';
+
+        // 识别失败步骤
+        if (errMsg.includes('Failed to get queries for') || errMsg.includes('Failed to get plan for')) {
+          failedStep = '获取查询定义（Central API 请求）';
+        } else if (errMsg.includes('Failed to analyze results')) {
+          failedStep = '发送分析请求（Central API 请求）';
+        } else if (errMsg.includes('SQL') || errMsg.includes('sql') || errMsg.includes('ER_')) {
+          failedStep = '执行 SQL 查询（数据库请求）';
+        }
+
+        // 识别错误类型并给出针对性诊断
+        if (errMsg.includes('ETIMEDOUT')) {
+          const target = errMsg.includes('Failed to get queries') || errMsg.includes('Failed to analyze') || errMsg.includes('Failed to get plan')
+            ? `中心 API (${this.centralAPI})` : `数据库 (${this.dbConfig.host}:${this.dbConfig.port})`;
+          diagnosis = `连接超时 - 无法连接到${target}\n\n请检查:\n1. ${target} 是否可访问\n2. 网络连接是否正常\n3. 防火墙是否放行`;
+        } else if (errMsg.includes('ECONNREFUSED')) {
+          const target = errMsg.includes('Failed to get queries') || errMsg.includes('Failed to analyze') || errMsg.includes('Failed to get plan')
+            ? `中心 API (${this.centralAPI})` : `数据库 (${this.dbConfig.host}:${this.dbConfig.port})`;
+          diagnosis = `连接被拒绝 - ${target} 未响应\n\n请检查:\n1. ${target} 服务是否已启动\n2. 端口是否正确`;
+        } else if (errMsg.includes('ECONNRESET') || errMsg.includes('socket hang up')) {
+          diagnosis = `连接被重置\n\n请检查:\n1. 中心 API (${this.centralAPI}) 是否稳定运行\n2. 数据库 (${this.dbConfig.host}:${this.dbConfig.port}) 是否正常`;
+        } else if (errMsg.includes('API returned')) {
+          diagnosis = `中心 API 返回错误\n\n请检查:\n1. 中心 API (${this.centralAPI}) 服务状态\n2. API Token 是否正确`;
+        } else if (errMsg.includes('ENOTFOUND') || errMsg.includes('getaddrinfo')) {
+          diagnosis = `域名解析失败\n\n请检查:\n1. 中心 API 地址 (${this.centralAPI}) 是否正确\n2. DNS 配置是否正常`;
+        } else {
+          diagnosis = `请检查:\n1. 中心 API 是否运行 (${this.centralAPI})\n2. 数据库连接是否正常 (${this.dbConfig.host}:${this.dbConfig.port})\n3. API Token 是否正确`;
+        }
+
+        const stepInfo = failedStep ? `\n失败步骤: ${failedStep}` : '';
+        const errorDetail = `❌ 工具执行失败${stepInfo}\n错误详情: ${errMsg}\n\n${diagnosis}`;
+
         return {
           content: [
             {
               type: 'text',
-              text: `❌ 工具执行失败: ${error.message}\n\n请检查:\n1. 中心 API 是否运行 (${this.centralAPI})\n2. 数据库连接是否正常 (${this.dbConfig.host}:${this.dbConfig.port})\n3. API Token 是否正确`,
+              text: errorDetail,
             },
           ],
           isError: true,
