@@ -611,6 +611,21 @@ class ThinMCPServer {
       port: parseInt(process.env.SR_PORT) || 9030,
     };
 
+    // SSH 跳板机配置（用于数据库隧道和远程 SSH 命令）
+    // 默认为空，仅当设置了 SSH_JUMP_HOST 环境变量时才启用跳板机作为降级方案
+    this.sshJumpHost = process.env.SSH_JUMP_HOST || '';
+    this.sshUser = process.env.SSH_USER || os.userInfo().username;
+    this.sshKeyPath = process.env.SSH_KEY_PATH || '';
+    this.sshTunnelProcess = null; // SSH 隧道进程
+    this.dbTunnelLocalPort = 19030; // 隧道本地端口
+    // 保存原始数据库地址（隧道建立后 dbConfig 会被改为 127.0.0.1:localPort）
+    this.originalDbHost = this.dbConfig.host;
+    this.originalDbPort = this.dbConfig.port;
+
+    // 连接模式状态（直连优先，跳板机降级）
+    this._dbConnectionMode = null;   // 'direct' | 'tunnel' | null (未探测)
+    this._sshNodeModes = {};         // { nodeIp: 'direct' | 'tunnel' } 逐节点 SSH 模式
+
     // Prometheus 配置
     this.prometheusConfig = {
       protocol: process.env.PROMETHEUS_PROTOCOL || 'http',
@@ -630,6 +645,9 @@ class ThinMCPServer {
     console.error('🤖 Thin MCP Server initialized');
     console.error(`   Central API: ${this.centralAPI}`);
     console.error(`   Database: ${this.dbConfig.host}:${this.dbConfig.port}`);
+    if (this.sshJumpHost) {
+      console.error(`   SSH Jump Host: ${this.sshJumpHost}`);
+    }
     console.error(
       `   Prometheus: ${this.prometheusConfig.protocol}://${this.prometheusConfig.host}:${this.prometheusConfig.port}`,
     );
@@ -665,6 +683,178 @@ class ThinMCPServer {
     // - requires_prometheus_query → Prometheus 查询
     //
     // 不再有 localTools 概念，所有工具都走 handleSolutionCTool
+  }
+
+  /**
+   * 建立 SSH 隧道到数据库（通过跳板机中转）
+   * 将远程数据库端口映射到本地 dbTunnelLocalPort
+   */
+  async ensureDbTunnel() {
+    // 如果没有跳板机或已经建立隧道，直接返回
+    if (!this.sshJumpHost || this.sshTunnelProcess) {
+      return;
+    }
+
+    // 使用原始数据库地址（dbConfig 可能已被改为 127.0.0.1:localPort）
+    const dbHost = this.originalDbHost || this.dbConfig.host;
+    const dbPort = this.originalDbPort || this.dbConfig.port;
+    const localPort = this.dbTunnelLocalPort;
+    const jumpSpec = this.sshJumpHost.includes('@')
+      ? this.sshJumpHost
+      : `${this.sshUser}@${this.sshJumpHost}`;
+    const keyOpt = this.sshKeyPath ? ['-i', this.sshKeyPath] : [];
+
+    console.error(`   🔗 建立 SSH 隧道: 127.0.0.1:${localPort} → ${dbHost}:${dbPort} (via ${this.sshJumpHost})`);
+
+    return new Promise((resolve) => {
+      const args = [
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'ConnectTimeout=10',
+        '-o', 'ServerAliveInterval=30',
+        '-o', 'ServerAliveCountMax=3',
+        '-N', // 不执行远程命令
+        '-L', `${localPort}:${dbHost}:${dbPort}`,
+        ...keyOpt,
+        jumpSpec,
+      ];
+
+      const tunnel = spawn('ssh', args, {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        detached: false,
+      });
+
+      this.sshTunnelProcess = tunnel;
+
+      tunnel.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) console.error(`   [SSH-Tunnel] ${msg}`);
+      });
+
+      tunnel.on('close', (code) => {
+        console.error(`   [SSH-Tunnel] 隧道关闭 (code=${code})`);
+        this.sshTunnelProcess = null;
+      });
+
+      // 等待隧道建立（给 SSH 一点时间建连）
+      setTimeout(() => {
+        if (tunnel.exitCode === null) {
+          // 隧道进程还在运行，修改 dbConfig 指向本地隧道端口
+          this.dbConfig.host = '127.0.0.1';
+          this.dbConfig.port = localPort;
+          console.error(`   ✅ SSH 隧道已建立, 数据库连接切换到 127.0.0.1:${localPort}`);
+        }
+        resolve();
+      }, 2000);
+    });
+  }
+
+  /**
+   * 初始化数据库连接（启动时调用）
+   * 不再主动建隧道，改为首次 getDbConnection() 时惰性探测（直连优先）
+   */
+  initDbConnection() {
+    if (this.sshJumpHost) {
+      console.error(`   SSH Jump Host 已配置: ${this.sshJumpHost} (将在直连失败时作为降级方案)`);
+    }
+  }
+
+  /**
+   * 获取数据库连接（直连优先，跳板机降级）
+   * - 首次调用时探测：先尝试直连，失败则通过跳板机建隧道
+   * - 探测结果缓存，后续调用直接使用已确定的模式
+   * - 连接失败时重置缓存，允许重新探测
+   */
+  async getDbConnection() {
+    // === 已确定为直连模式 ===
+    if (this._dbConnectionMode === 'direct') {
+      try {
+        return await mysql.createConnection({
+          host: this.originalDbHost,
+          port: this.originalDbPort,
+          user: this.dbConfig.user,
+          password: this.dbConfig.password,
+          connectTimeout: 10000,
+        });
+      } catch (err) {
+        console.error(`   ⚠️ 数据库直连失败，重置连接模式: ${err.message}`);
+        this._dbConnectionMode = null;
+        // 递归重新探测
+        return await this.getDbConnection();
+      }
+    }
+
+    // === 已确定为隧道模式 ===
+    if (this._dbConnectionMode === 'tunnel') {
+      // 检查隧道活性，死了重建
+      if (!this.sshTunnelProcess) {
+        console.error('   🔗 SSH 隧道已断开，重新建立...');
+        await this.ensureDbTunnel();
+      }
+      try {
+        return await mysql.createConnection({
+          host: '127.0.0.1',
+          port: this.dbTunnelLocalPort,
+          user: this.dbConfig.user,
+          password: this.dbConfig.password,
+          connectTimeout: 10000,
+        });
+      } catch (err) {
+        console.error(`   ⚠️ 隧道连接失败，重置连接模式: ${err.message}`);
+        this._dbConnectionMode = null;
+        this.sshTunnelProcess = null;
+        return await this.getDbConnection();
+      }
+    }
+
+    // === 首次：探测连接模式 ===
+    // 1. 尝试直连
+    try {
+      console.error(`   🔍 尝试直连数据库 ${this.originalDbHost}:${this.originalDbPort}...`);
+      const conn = await mysql.createConnection({
+        host: this.originalDbHost,
+        port: this.originalDbPort,
+        user: this.dbConfig.user,
+        password: this.dbConfig.password,
+        connectTimeout: 5000,
+      });
+      await conn.execute('SELECT 1');
+      this._dbConnectionMode = 'direct';
+      // 确保 dbConfig 指向原始地址（以前可能被隧道改过）
+      this.dbConfig.host = this.originalDbHost;
+      this.dbConfig.port = this.originalDbPort;
+      console.error(`   ✅ 数据库直连成功`);
+      return conn;
+    } catch (directErr) {
+      console.error(`   ⚠️ 数据库直连失败: ${directErr.message}`);
+    }
+
+    // 2. 直连失败，尝试隧道降级
+    if (this.sshJumpHost) {
+      try {
+        console.error(`   🔗 降级到 SSH 隧道模式 (via ${this.sshJumpHost})...`);
+        await this.ensureDbTunnel();
+        const conn = await mysql.createConnection({
+          host: '127.0.0.1',
+          port: this.dbTunnelLocalPort,
+          user: this.dbConfig.user,
+          password: this.dbConfig.password,
+          connectTimeout: 10000,
+        });
+        await conn.execute('SELECT 1');
+        this._dbConnectionMode = 'tunnel';
+        // 更新 dbConfig 指向隧道（兼容其他可能直接读 dbConfig 的地方）
+        this.dbConfig.host = '127.0.0.1';
+        this.dbConfig.port = this.dbTunnelLocalPort;
+        console.error(`   ✅ SSH 隧道连接成功`);
+        return conn;
+      } catch (tunnelErr) {
+        console.error(`   ❌ SSH 隧道连接也失败: ${tunnelErr.message}`);
+        throw tunnelErr;
+      }
+    }
+
+    // 无跳板机可用
+    throw new Error(`数据库连接失败: 直连 ${this.originalDbHost}:${this.originalDbPort} 失败且未配置 SSH_JUMP_HOST`);
   }
 
   /**
@@ -954,13 +1144,13 @@ class ThinMCPServer {
    * 本地处理 fetch_logs 工具（避免嵌套调用）
    */
   async handleFetchLogsLocally(args, requestId = null) {
-    const { nodes = [], keyword = '', keywords = [], last_hours = 2, log_level = 'INFO', context_lines = 0, ssh_user, ssh_key_path } = args;
+    const { nodes = [], keyword = '', keywords = [], last_hours = 2, log_level = 'INFO', context_lines = 0, ssh_user, ssh_key_path, ssh_jump_host } = args;
 
     // 支持单个 keyword 或多个 keywords 数组
     const keywordList = keywords.length > 0 ? keywords : (keyword ? [keyword] : []);
 
     // SSH 配置 - 传递给 executeSshCommands
-    const sshConfig = { ssh_user, ssh_key_path };
+    const sshConfig = { ssh_user, ssh_key_path, ssh_jump_host };
 
     console.error(`      📋 Local fetch_logs: ${nodes.length} nodes, keywords=${JSON.stringify(keywordList)}`);
     console.error(`      📋 SSH config: user=${ssh_user}, key_path=${ssh_key_path || '(default)'}`);
@@ -1330,6 +1520,7 @@ class ThinMCPServer {
         method: 'POST',
         headers: headers,
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(120000), // 120 秒超时
       });
 
       if (!response.ok) {
@@ -1388,7 +1579,9 @@ class ThinMCPServer {
     // 执行 SQL 查询
     if (sqlQueries.length > 0) {
       try {
-        connection = await mysql.createConnection(this.dbConfig);
+        fs.appendFileSync('/tmp/mcp_debug.log', `${new Date().toISOString()} [executeQueries] Getting DB connection...\n`);
+        connection = await this.getDbConnection();
+        fs.appendFileSync('/tmp/mcp_debug.log', `${new Date().toISOString()} [executeQueries] DB connected to ${this.dbConfig.host}:${this.dbConfig.port}\n`);
         // 禁用当前 session 的 profile 记录，避免系统查询挤掉用户查询的 profile
         await connection.query('SET enable_profile = false');
         console.error('   Disabled profile recording for this session');
@@ -1448,8 +1641,10 @@ class ThinMCPServer {
     }
 
     // 执行 Prometheus 查询
+    fs.appendFileSync('/tmp/mcp_debug.log', `${new Date().toISOString()} [executeQueries] Prometheus queries: ${prometheusQueries.length}, SQL queries: ${sqlQueries.length}\n`);
     for (const query of prometheusQueries) {
       try {
+        fs.appendFileSync('/tmp/mcp_debug.log', `${new Date().toISOString()} [executeQueries] Starting Prometheus: ${query.id} (${query.type})\n`);
         console.error(
           `Executing Prometheus query: ${query.id} (${query.type})`,
         );
@@ -1469,6 +1664,7 @@ class ThinMCPServer {
         } else {
           results[query.id] = await this.queryPrometheusInstant(query);
         }
+        fs.appendFileSync('/tmp/mcp_debug.log', `${new Date().toISOString()} [executeQueries] Prometheus done: ${query.id}\n`);
 
         // 记录查询结果
         if (requestId) {
@@ -1495,6 +1691,9 @@ class ThinMCPServer {
     return results;
   }
 
+  // Prometheus 查询的超时信号（30秒）
+  _prometheusTimeout() { return AbortSignal.timeout(30000); }
+
   /**
    * 查询 Prometheus 即时数据
    */
@@ -1509,6 +1708,7 @@ class ThinMCPServer {
     const response = await fetch(`${url}?${params}`, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
+      signal: this._prometheusTimeout(),
     });
 
     if (!response.ok) {
@@ -1594,6 +1794,7 @@ class ThinMCPServer {
     const response = await fetch(`${url}?${params}`, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
+      signal: this._prometheusTimeout(),
     });
 
     if (!response.ok) {
@@ -1883,28 +2084,84 @@ class ThinMCPServer {
 
     const startTime = Date.now();
     const maxConcurrency = 5; // SSH 连接并发数较低
-    const commandTimeoutMs = 60000; // 60 秒超时（SSH 可能需要更长时间）
 
     // 获取 SSH 配置（默认使用当前系统用户）
     const sshUser =
       sshConfig.ssh_user || process.env.SSH_USER || os.userInfo().username;
     const sshKeyPath = sshConfig.ssh_key_path || process.env.SSH_KEY_PATH || '';
+    const sshJumpHost = sshConfig.ssh_jump_host || process.env.SSH_JUMP_HOST || '';
     // 注意：密码模式需要 sshpass，暂未实现
 
-    // 构建 SSH 基础命令
-    const buildSshCmd = (nodeIp, remoteCmd) => {
-      let sshBase = `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10`;
-      if (sshKeyPath) {
-        sshBase += ` -i "${sshKeyPath}"`;
+    // === SSH 连接模式探测（逐节点探测，直连优先，跳板机降级） ===
+    // 不同节点可能有不同的网络可达性（如部分节点可直连，部分需要跳板机）
+
+    // 收集需要探测的节点（去重，跳过已探测的）
+    const uniqueNodeIps = [...new Set(commands.map(c => c.node_ip))];
+    const nodesToProbe = uniqueNodeIps.filter(ip => !this._sshNodeModes[ip]);
+
+    if (nodesToProbe.length > 0) {
+      console.error(`   🔍 探测 ${nodesToProbe.length} 个节点的 SSH 直连性...`);
+      // 并发探测所有未知节点
+      const probeResults = await Promise.all(
+        nodesToProbe.map(async (nodeIp) => {
+          try {
+            const sshOpts = `-o StrictHostKeyChecking=no -o ConnectTimeout=5`;
+            const keyOpt = sshKeyPath ? ` -i "${sshKeyPath}"` : '';
+            const testCmd = `ssh ${sshOpts}${keyOpt} ${sshUser}@${nodeIp} "echo ok"`;
+            const { stdout } = await execAsync(testCmd, { timeout: 10000 });
+            return { nodeIp, direct: stdout.trim().includes('ok') };
+          } catch {
+            return { nodeIp, direct: false };
+          }
+        })
+      );
+
+      for (const { nodeIp, direct } of probeResults) {
+        if (direct) {
+          this._sshNodeModes[nodeIp] = 'direct';
+          console.error(`   ✅ ${nodeIp}: 直连成功`);
+        } else if (sshJumpHost) {
+          this._sshNodeModes[nodeIp] = 'tunnel';
+          console.error(`   ⚠️ ${nodeIp}: 直连失败，使用跳板机 (${sshJumpHost})`);
+        } else {
+          this._sshNodeModes[nodeIp] = 'direct'; // 无跳板机，只能直连
+          console.error(`   ⚠️ ${nodeIp}: 直连失败，无跳板机可降级`);
+        }
       }
-      // 注意：密码模式需要 sshpass，这里简化处理，优先使用密钥
-      // 转义 $ 和 " 以防止本地 shell 展开 $(...) 和处理引号
-      const escapedCmd = remoteCmd
-        .replace(/\\/g, '\\\\') // 先转义反斜杠
-        .replace(/"/g, '\\"') // 转义双引号
-        .replace(/\$/g, '\\$') // 转义 $ 防止本地 shell 展开
-        .replace(/`/g, '\\`'); // 转义反引号
-      return `${sshBase} ${sshUser}@${nodeIp} "${escapedCmd}"`;
+    }
+
+    // 构建 SSH 基础命令（根据每个节点的探测结果选择模式）
+    const buildSshCmd = (nodeIp, remoteCmd) => {
+      const sshOpts = `-o StrictHostKeyChecking=no -o ConnectTimeout=30`;
+      const keyOpt = sshKeyPath ? ` -i "${sshKeyPath}"` : '';
+      const nodeUseTunnel = this._sshNodeModes[nodeIp] === 'tunnel' && sshJumpHost;
+
+      if (nodeUseTunnel) {
+        // 嵌套 SSH：先连跳板机，再从跳板机连目标节点（使用跳板机上的密钥）
+        // 用 base64 编码传递命令，避免多层转义的复杂性
+        // 方案: ssh jumphost "echo B64 | base64 -d | ssh target 'bash -s'"
+        //   - base64 编码保留命令原文（含 $、引号等特殊字符）
+        //   - 在跳板机上解码后通过 stdin 管道给目标节点的 bash -s 执行
+        const b64Cmd = Buffer.from(remoteCmd).toString('base64');
+        const jumpSpec = sshJumpHost.includes('@') ? sshJumpHost : `${sshUser}@${sshJumpHost}`;
+        const jumpCmd = `echo ${b64Cmd} | base64 -d | ssh ${sshOpts} ${sshUser}@${nodeIp} 'bash -s'`;
+        // 外层只需转义 $ 防止本地 shell 展开
+        const outerEscaped = jumpCmd.replace(/\$/g, '\\$');
+        return `ssh ${sshOpts}${keyOpt} ${jumpSpec} "${outerEscaped}"`;
+      } else {
+        // 直连模式
+        const escapedCmd = remoteCmd
+          .replace(/\\/g, '\\\\')
+          .replace(/"/g, '\\"')
+          .replace(/\$/g, '\\$')
+          .replace(/`/g, '\\`');
+        return `ssh ${sshOpts}${keyOpt} ${sshUser}@${nodeIp} "${escapedCmd}"`;
+      }
+    };
+    // 超时根据节点模式动态设置
+    const getTimeoutMs = (nodeIp) => {
+      const nodeUseTunnel = this._sshNodeModes[nodeIp] === 'tunnel' && sshJumpHost;
+      return nodeUseTunnel ? 120000 : 60000;
     };
 
     // 分批并发执行
@@ -2081,7 +2338,7 @@ class ThinMCPServer {
 
             // 其他命令类型使用 execAsync
             const { stdout, stderr } = await execAsync(fullCmd, {
-              timeout: commandTimeoutMs,
+              timeout: getTimeoutMs(nodeIp),
               maxBuffer: 50 * 1024 * 1024, // 50MB（日志可能较大）
             });
 
@@ -2380,7 +2637,7 @@ class ThinMCPServer {
    */
   async fetchQueryProfiles(profileList, options = {}) {
     const profiles = {};
-    const connection = await mysql.createConnection(this.dbConfig);
+    const connection = await this.getDbConnection();
 
     try {
       // 禁用当前 session 的 profile 记录，避免 get_query_profile 查询挤掉用户查询的 profile
@@ -2705,7 +2962,7 @@ class ThinMCPServer {
    */
   async fetchTableSchemas(tableNames) {
     const schemas = {};
-    const connection = await mysql.createConnection(this.dbConfig);
+    const connection = await this.getDbConnection();
 
     try {
       // 禁用当前 session 的 profile 记录
@@ -2955,6 +3212,7 @@ class ThinMCPServer {
         method: 'POST',
         headers: headers,
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(120000), // 120 秒超时
       });
 
       if (!response.ok) {
@@ -3082,6 +3340,9 @@ class ThinMCPServer {
         if (slowMatch) briefSummary += `- 慢任务数: ${slowMatch[1]}\n`;
         if (durationMatch) briefSummary += `- 最慢任务耗时: ${durationMatch[1]} 分钟\n`;
         if (issuesMatch) briefSummary += `- 发现问题: ${issuesMatch.length} 个\n`;
+      } else if (report.includes('FE JVM 内存') || report.includes('内存综合诊断')) {
+        briefSummary += '📊 **FE 内存分析摘要**\n';
+        briefSummary += '- 详细信息请查看完整报告\n';
       } else if (report.includes('数据导入') || report.includes('Load')) {
         briefSummary += '📊 **导入分析摘要**\n';
         briefSummary += '- 详细信息请查看完整报告\n';
@@ -3354,6 +3615,12 @@ class ThinMCPServer {
       report += ` | ${firstLine}`;
     }
 
+    // 如果需要用户输入（如 sudo 密码），附加提示信息
+    if (analysis.needs_user_input && analysis.user_input_hint) {
+      report += `\n\n⚠️ ${analysis.step_summary}`;
+      report += `\n💡 ${analysis.user_input_hint}`;
+    }
+
     return report;
   }
 
@@ -3584,8 +3851,11 @@ class ThinMCPServer {
         }
 
         // 从保存的 args 恢复参数（如果当前请求没有提供）
+        // 注意：continue_from_step 不应从 args 恢复，它由 session 的 lastCompletedStep 控制
+        const argsRestoreExcludeKeys = ['continue_from_step'];
         if (restoredArgs) {
           for (const key of Object.keys(restoredArgs)) {
+            if (argsRestoreExcludeKeys.includes(key)) continue;
             if (restoredArgs[key] !== undefined && processedArgs[key] === undefined) {
               processedArgs[key] = restoredArgs[key];
               console.error(`   📦 从 args 恢复: ${key}`);
@@ -3598,7 +3868,15 @@ class ThinMCPServer {
         if (lastCompletedStep > 0) {
           // nextContinueFromStep 是 Central API 返回的内部步骤号，考虑了步骤跳过的情况
           // 例如：当 detect_garbage_files=false 时，显示步骤 4 完成后，内部步骤应该是 6（跳过了内部步骤 4）
-          processedArgs.continue_from_step = nextContinueFromStep || (lastCompletedStep + 1);
+          const sessionNextStep = nextContinueFromStep || (lastCompletedStep + 1);
+          const userRequestedStep = processedArgs.continue_from_step;
+          // 如果用户显式请求的步骤 <= lastCompletedStep，说明用户想重试某个步骤
+          // （如提供 sudo_password 重试 jmap），此时尊重用户的选择，不自动推进到下一步
+          if (userRequestedStep && userRequestedStep <= lastCompletedStep) {
+            console.error(`   📍 用户请求重试步骤 ${userRequestedStep}（会话已完成步骤 ${lastCompletedStep}），保留用户选择`);
+          } else {
+            processedArgs.continue_from_step = sessionNextStep;
+          }
           console.error(`   📍 设置 continue_from_step=${processedArgs.continue_from_step} (nextContinueFromStep=${nextContinueFromStep}, 显示步骤 ${lastCompletedStep})`);
 
           // 将恢复的中间结果合并到 processedArgs 中（API 端从 args 中读取这些值）
@@ -3754,6 +4032,7 @@ class ThinMCPServer {
         console.error(
           '   Step 3: Sending results to Central API for analysis...',
         );
+        fs.appendFileSync('/tmp/mcp_debug.log', `${new Date().toISOString()} [handleSolutionCTool] Step 3: Sending to analyzeResultsWithAPI, results keys: ${Object.keys(results).join(',')}\n`);
         // 调试：发送给中央 API 前检查 _intermediate
         if (results._intermediate) {
           console.error(`   [DEBUG] 发送给 API 的 results._intermediate keys: ${Object.keys(results._intermediate).join(', ')}`);
@@ -3941,6 +4220,8 @@ class ThinMCPServer {
                 processedArgs.ssh_key_path || analysis.next_args?.ssh_key_path,
               ssh_password:
                 processedArgs.ssh_password || analysis.next_args?.ssh_password,
+              ssh_jump_host:
+                processedArgs.ssh_jump_host || analysis.next_args?.ssh_jump_host,
             };
 
             const sshResults = await this.executeSshCommands(
@@ -4554,6 +4835,9 @@ class ThinMCPServer {
         };
       }
     });
+
+    // 初始化数据库连接（探测直连，必要时建 SSH 隧道）
+    this.initDbConnection();
 
     // 启动 Stdio 传输
     const transport = new StdioServerTransport();
