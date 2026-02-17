@@ -3343,6 +3343,9 @@ class ThinMCPServer {
       } else if (report.includes('FE JVM 内存') || report.includes('内存综合诊断')) {
         briefSummary += '📊 **FE 内存分析摘要**\n';
         briefSummary += '- 详细信息请查看完整报告\n';
+      } else if (report.includes('CN 内存') || report.includes('Memory Tracker')) {
+        briefSummary += '📊 **CN 内存分析摘要**\n';
+        briefSummary += '- 详细信息请查看完整报告\n';
       } else if (report.includes('数据导入') || report.includes('Load')) {
         briefSummary += '📊 **导入分析摘要**\n';
         briefSummary += '- 详细信息请查看完整报告\n';
@@ -4024,6 +4027,7 @@ class ThinMCPServer {
           'desc_storage_volumes': '获取存储卷详情',
           'analyze_schema': '分析表结构',
           'analyze_trace': '分析 Trace 日志',
+          'mem_tracker': '获取 CN 节点 Memory Tracker 数据',
         };
 
         console.error(`\n   📍 [阶段 1] 初始分析...`);
