@@ -1205,9 +1205,25 @@ class ThinMCPServer {
 
       const logDir = result.output.trim();
       const nodeType = result.node_type;
-      // CN/BE 日志文件名格式: cn.INFO.log.*, cn.WARNING.log.*, be.INFO.log.* 等
-      // FE 日志文件名格式: fe.log*
-      const logFile = nodeType === 'fe' ? 'fe.log*' : nodeType === 'cn' ? 'cn.*.log*' : 'be.*.log*';
+      // 根据 log_level 和 nodeType 选择正确的日志文件模式
+      let logFile;
+      if (nodeType === 'fe') {
+        if (log_level === 'PROFILE') {
+          logFile = 'fe.profile.log*';
+        } else if (log_level === 'WARNING' || log_level === 'ERROR') {
+          logFile = 'fe.warn.log*';
+        } else {
+          logFile = 'fe.log*';
+        }
+      } else {
+        // CN/BE 日志文件名格式: cn.INFO.log.*, cn.WARNING.log.*, be.INFO.log.* 等
+        const prefix = nodeType === 'cn' ? 'cn' : 'be';
+        if (log_level === 'WARNING' || log_level === 'ERROR') {
+          logFile = `${prefix}.WARNING.log*`;
+        } else {
+          logFile = `${prefix}.*.log*`;
+        }
+      }
 
       // 构建日志拉取命令
       // 使用更大的 mtime 范围以确保能找到所有轮转的日志文件
