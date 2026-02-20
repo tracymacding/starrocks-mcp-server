@@ -1134,10 +1134,100 @@ class ThinMCPServer {
    * 生成发现 CN 日志路径的 SSH 命令
    */
   getDiscoverCnLogPathCommand(bePort = null) {
+    const psFallback = `ps -eo cmd | grep 'starrocks_be.*--cn' | grep -v grep | grep -oE '/[^ ]*starrocks_be' | head -1 | sed 's|/lib/starrocks_be$|/log|; s|/bin/starrocks_be$|/log|'`;
     if (bePort) {
-      return `lsof -i :${bePort} -s TCP:LISTEN -t 2>/dev/null | head -1 | xargs -I{} ps -p {} -o args= 2>/dev/null | grep -oE '/[^ ]*starrocks_be' | sed 's|/lib/starrocks_be$|/log|; s|/bin/starrocks_be$|/log|'`;
+      // lsof 需要 root 权限才能查看其他用户的进程端口，非 root 用户可能失败
+      // 因此加 fallback 到 ps 命令
+      const lsofCmd = `lsof -i :${bePort} -s TCP:LISTEN -t 2>/dev/null | head -1 | xargs -I{} ps -p {} -o args= 2>/dev/null | grep -oE '/[^ ]*starrocks_be' | sed 's|/lib/starrocks_be$|/log|; s|/bin/starrocks_be$|/log|'`;
+      return `result=$(${lsofCmd}); [ -n "$result" ] && echo "$result" || ${psFallback}`;
     }
-    return `ps -eo cmd | grep 'starrocks_be.*--cn' | grep -v grep | grep -oE '/[^ ]*starrocks_be' | head -1 | sed 's|/lib/starrocks_be$|/log|; s|/bin/starrocks_be$|/log|'`;
+    return psFallback;
+  }
+
+  /**
+   * 构建远端时间过滤命令
+   * 在远端 awk 按时间戳过滤，只传输 last_hours 内的日志，避免传输整个大文件
+   * @param {string} nodeType - 'fe' | 'cn' | 'be'
+   * @param {number} lastHours - 过滤最近 N 小时
+   * @returns {string|null} awk 过滤命令，null 表示不过滤
+   */
+  _buildRemoteTimeFilter(nodeType, lastHours) {
+    if (!lastHours || lastHours <= 0) return null;
+
+    // 计算起始时间
+    const now = new Date();
+    const startTime = new Date(now.getTime() - lastHours * 3600 * 1000);
+
+    if (nodeType === 'fe') {
+      // FE Java 日志时间戳格式: "2026-02-19 17:25:34,123" 或 "2026-02-19 17:25:34.123+08:00"
+      // 用 awk 按 "YYYY-MM-DD HH" 前缀过滤（精确到小时，简单高效）
+      // 生成从 startTime 到 now 的所有 "YYYY-MM-DD HH" 前缀
+      const prefixes = [];
+      const cursor = new Date(startTime);
+      cursor.setMinutes(0, 0, 0); // 对齐到小时
+      while (cursor <= now) {
+        const yyyy = cursor.getFullYear();
+        const mm = String(cursor.getMonth() + 1).padStart(2, '0');
+        const dd = String(cursor.getDate()).padStart(2, '0');
+        const hh = String(cursor.getHours()).padStart(2, '0');
+        prefixes.push(`${yyyy}-${mm}-${dd} ${hh}`);
+        cursor.setTime(cursor.getTime() + 3600 * 1000);
+      }
+      if (prefixes.length === 0) return null;
+      // 使用 awk 保留续行（Java stack trace 等多行日志）
+      // FE 日志头行以 "YYYY-MM-DD HH" 开头
+      const awkPattern = prefixes.map(p => `^${p.replace(/-/g, '\\-')}`).join('|');
+      // awk 逻辑：遇到时间戳头行时判断是否匹配，匹配则输出并标记；
+      // 非头行（如 \tat、Caused by 等 stack trace）若上一条匹配则继续输出
+      return `awk '/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:/{if(/${awkPattern}/){printing=1}else{printing=0}} printing'`;
+    } else {
+      // CN/BE glog 时间戳格式有两种:
+      //   旧版: "W0219 17:25:34.123456" (MMDD，4位)
+      //   新版(3.3+): "W20260219 17:25:34.123456" (YYYYMMDD，8位)
+      // 第一个字符是级别 (W/E/I/F)，后面是日期，空格后是 HH:MM:SS
+      // 生成 "日期+小时" 级精确匹配（与 FE 一致），避免拉取整天的日志
+      const dateHours = [];
+      const cursor = new Date(startTime);
+      cursor.setMinutes(0, 0, 0); // 对齐到小时
+      while (cursor <= now) {
+        const yyyy = cursor.getFullYear();
+        const mm = String(cursor.getMonth() + 1).padStart(2, '0');
+        const dd = String(cursor.getDate()).padStart(2, '0');
+        const hh = String(cursor.getHours()).padStart(2, '0');
+        dateHours.push({ short: `${mm}${dd}`, long: `${yyyy}${mm}${dd}`, hh });
+        cursor.setTime(cursor.getTime() + 3600 * 1000);
+      }
+      if (dateHours.length === 0) return null;
+
+      // 按日期分组，合并同日期的小时
+      const dateMap = new Map();
+      for (const dh of dateHours) {
+        const key = `${dh.short}|${dh.long}`;
+        if (!dateMap.has(key)) dateMap.set(key, { short: dh.short, long: dh.long, hours: [] });
+        dateMap.get(key).hours.push(dh.hh);
+      }
+
+      if (dateMap.size <= 3) {
+        // 构建 awk：先匹配日期头行，再检查小时
+        // glog 头行格式: "W20260220 12:34:56" 或 "W0220 12:34:56"
+        // 用 awk 提取头行后的小时部分进行精确过滤
+        const dateEntries = [...dateMap.values()];
+        const datePatterns = dateEntries.flatMap(d => [`^[WEIF]${d.long}`, `^[WEIF]${d.short}[^0-9]`]);
+        const datePattern = datePatterns.join('|');
+
+        // 收集所有允许的 "日期 小时" 组合
+        // awk 逻辑：头行匹配日期 → 提取小时 → 检查小时是否在范围内
+        const allHours = [...new Set(dateHours.map(dh => dh.hh))];
+        const hourPattern = allHours.join('|');
+
+        // awk: 头行匹配日期后，用 substr 提取空格后的2位小时进行二次过滤
+        // glog 头行中空格位置：新版 pos=10 (W+8位日期)，旧版 pos=6 (W+4位日期+非数字)
+        // 统一方案：用 index($0, " ") 定位空格，取空格后2字符作为小时
+        return `awk '/^[WEIF][0-9]/{if(/${datePattern}/){h=substr($0,index($0," ")+1,2);if(h~/${hourPattern}/){printing=1}else{printing=0}}else{printing=0}} printing'`;
+      }
+      // 日期多时不过滤
+      return null;
+    }
   }
 
   /**
@@ -1178,6 +1268,10 @@ class ThinMCPServer {
 
     const pathResults = await this.executeSshCommands(discoverCommands, sshConfig, requestId);
     console.error(`         ✅ Discovered ${pathResults.ssh_summary.successful} paths`);
+    // 调试：打印每个节点的路径发现结果
+    for (const r of pathResults.ssh_results) {
+      fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] discover ${r.node_ip}(${r.node_type}): success=${r.success}, output="${(r.output||'').trim()}", error="${r.error||r.stderr||''}"\n`);
+    }
 
     // SSH 全部失败时提前返回，避免后续无意义的日志拉取
     if (pathResults.ssh_summary.successful === 0) {
@@ -1227,7 +1321,6 @@ class ThinMCPServer {
 
       // 构建日志拉取命令
       // 使用更大的 mtime 范围以确保能找到所有轮转的日志文件
-      // 实际的时间过滤由日志内容的时间戳来完成
       const mtimeDays = Math.max(Math.ceil(last_hours / 24), 7);  // 至少搜索 7 天
 
       // 先列出找到的文件（用于调试）
@@ -1237,17 +1330,33 @@ class ThinMCPServer {
       console.error(`         📂 Find command: ${findCmd}`);
       console.error(`         📂 mtime days: ${mtimeDays}, last_hours: ${last_hours}`);
 
+      // 构建远端时间过滤命令，避免传输整个日志文件
+      // FE 时间戳: "2026-02-19 17:25:34,123" → 按日期+小时过滤
+      // CN glog 时间戳: "W0219 17:25:34.123456" → 按 MMDD 过滤
+      const timeFilterCmd = this._buildRemoteTimeFilter(nodeType, last_hours);
+
       if (keywordList.length > 0) {
         // 使用 OR 逻辑搜索任意一个关键词（使用 grep -E 正则）
-        // 例如: find ... | xargs grep -ahE "keyword1|keyword2"
         const grepPattern = keywordList.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-        fetchCmd += ` | xargs grep -ahE "${grepPattern}"`;  // -h 去掉文件名前缀, -a 强制处理二进制文件, -E 扩展正则
+        if (timeFilterCmd) {
+          fetchCmd += ` | xargs ${timeFilterCmd} | grep -aE "${grepPattern}"`;
+        } else {
+          fetchCmd += ` | xargs grep -ahE "${grepPattern}"`;
+        }
         if (context_lines > 0) {
           fetchCmd += ` -A ${context_lines} -B ${context_lines}`;
         }
       } else {
-        fetchCmd += ` | xargs cat`;
+        if (timeFilterCmd) {
+          fetchCmd += ` | xargs ${timeFilterCmd}`;
+        } else {
+          fetchCmd += ` | xargs cat`;
+        }
       }
+
+      // 添加 tail 限制：确保只取最新的日志行（而非最旧的）
+      // 每节点最多取 20000 行原始日志（含 stack trace 多行），足够解析出 ~5000 条日志条目
+      fetchCmd += ' | tail -20000';
 
       console.error(`         🔍 Full fetch command: ${fetchCmd}`);
       fetchCommands.push({
@@ -2209,7 +2318,11 @@ class ThinMCPServer {
 
             // 根据命令类型选择执行方式
             const commandType = cmd.command_type || 'generic';
-            fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] command_type: ${commandType}, cmd keys: ${Object.keys(cmd).join(',')}\n`);
+            const nodeMode = this._sshNodeModes[nodeIp] || 'unknown';
+            fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] command_type: ${commandType}, node=${nodeIp}(${cmd.node_type}), mode=${nodeMode}, cmd keys: ${Object.keys(cmd).join(',')}\n`);
+            if (commandType === 'fetch_log_content') {
+              fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] fetch_log_content fullCmd: ${fullCmd.substring(0, 200)}...\n`);
+            }
 
             // fetch_log_scp 使用 spawn 流式传输，需要单独处理
             if (commandType === 'fetch_log_scp') {
@@ -2437,6 +2550,7 @@ class ThinMCPServer {
             const duration = Date.now() - (cmdStartTime || Date.now());
             const nodeIp = cmd.node_ip;
             const commandType = cmd.command_type || 'generic';
+            fs.appendFileSync('/tmp/mcp_debug.log', `[${new Date().toISOString()}] CATCH: node=${nodeIp}, type=${commandType}, error=${(error.message||'').substring(0,200)}, code=${error.code}, stdout_len=${(error.stdout||'').length}, stderr_len=${(error.stderr||'').length}\n`);
 
             // 检查是否有 stdout 输出（即使命令返回非零退出码）
             // Node.js exec 在非零退出码时会抛异常，但 error.stdout 可能仍有有效输出
@@ -3228,7 +3342,7 @@ class ThinMCPServer {
         method: 'POST',
         headers: headers,
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(120000), // 120 秒超时
+        signal: AbortSignal.timeout(300000), // 300 秒超时（LLM 深度诊断可能需要较长时间）
       });
 
       if (!response.ok) {
